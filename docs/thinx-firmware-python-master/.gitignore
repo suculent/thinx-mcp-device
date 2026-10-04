@@ -1,0 +1,10 @@
+**/__pycache__
+build/
+dist/
+node_modules/
+
+# local config
+thinx/thinx.cfg
+
+venv/
+.idea/

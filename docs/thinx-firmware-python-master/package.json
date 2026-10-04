@@ -1,0 +1,8 @@
+{
+  "scripts": {
+    "snyk" : "snyk test --file=requirements.txt"
+  },
+  "dependencies": {
+    "snyk": "^1.456.0"
+  }
+}
