@@ -6,8 +6,8 @@ Simple MCP stdio server that acts like a THiNX device client:
 - still supports reading credentials from the `.ino` file as a fallback
 - calls THiNX registration using the firmware-compatible `registration` body
 - stores the returned UDID in `.thinx-device-state.json`
-- connects to MQTT with `username = udid` and `password = api_key`
-- subscribes to `/<owner>/<udid>` and `/<owner>/<udid>/#`
+- connects to MQTT with `username = udid` and `password = api_key` automatically after each successful check-in
+- subscribes to `/<owner>/<udid>` and `/<owner>/shared/#` (the topics the THiNX device ACL grants)
 - identifies the device with a real interface MAC, preferring `en0`, then `eth0`, then `wlan0`
 
 Default settings live in:
@@ -44,8 +44,8 @@ For an MCP client, use:
 
 ## Tools
 
-- `thinx_register`: POSTs to THiNX registration and saves the returned UDID.
-- `thinx_connect_mqtt`: connects MQTT and starts listening.
+- `thinx_register`: POSTs to THiNX registration, saves the returned UDID, then connects MQTT and listens (see below).
+- `thinx_connect_mqtt`: connects MQTT and starts listening (registers first if needed).
 - `thinx_status`: shows redacted API key, UDID, topics, and connection state.
 - `thinx_recent_messages`: returns received MQTT messages buffered by the server.
 - `thinx_publish_status`: publishes to `/<owner>/<udid>/status`.
@@ -55,6 +55,41 @@ For an MCP client, use:
 - `thinx_login`: logs in as the device owner and caches a session token.
 - `thinx_get_environment`: inspects the device's environment variables via `POST /api/v2/device`.
 - `thinx_set_environment`: sets environment variables via `PUT /api/v2/device` (merges by default).
+
+### MQTT
+
+After every successful check-in (`thinx_register` or the periodic check-in), the
+device connects to the broker and listens, as THiNXLib does after registration:
+
+- Broker `mqtt://<mqttHost>:<mqttPort>` (default `thinx.cloud:1883`). The client ID
+  is the device MAC, `username` is the UDID and `password` is the device API key.
+  The last will is `{"status":"disconnected"}`, retained on `/<owner>/<udid>/status`.
+- On connect it subscribes to `/<owner>/<udid>` and `/<owner>/shared/#`, then
+  publishes a retained `{"status":"connected"}` to `/<owner>/<udid>/status`.
+- These are the topics the backend's ACL grants a device (`authorize_mqtt`):
+  `/<owner>/<udid>`, `/<owner>/<udid>/status` and `/<owner>/shared/#`.
+  `/<owner>/<udid>/#` is not granted. It is subscribed only with
+  `thinx_connect_mqtt { "subscribeWildcard": true }`, and a refusal shows as
+  `granted: false` under `subscriptions`. If the device channel itself is refused,
+  the connection counts as failed.
+- The backend writes the device's MQTT credentials to Redis asynchronously during
+  check-in, so a first connect can be refused. The client tries 3 times, 2 s apart
+  (`connectAttempts` / `retryDelayMs` on `thinx_connect_mqtt`).
+- An MQTT failure never fails the registration. The `thinx_register` result carries
+  an `mqtt` block (`connected`, `subscriptions`, `lastError`, or `error`).
+- Later check-ins reuse the existing client, and mqtt.js reconnects it after drops
+  (every 30 s). `thinx_connect_mqtt` also starts the periodic check-in
+  (`checkinIntervalSeconds`, default 300).
+- Received messages (except the device's own status topic) are buffered for
+  `thinx_recent_messages` (last 100). A message carrying an OTT starts the firmware
+  download described below.
+- `thinx_disconnect_mqtt` publishes a retained `disconnected` status and closes the
+  connection. The next check-in connects again, unless it passes `connectMqtt: false`.
+
+Turn the automatic connect off with `autoConnectMqtt: false` in the config,
+`THINX_AUTO_CONNECT_MQTT=false`, or `connectMqtt: false` on a single
+`thinx_register` call. `thinx_status` shows `mqttConnected`, `mqttSubscriptions`
+and `lastMqttError`.
 
 ### Acting as an Arduino / PlatformIO device (OTT firmware updates)
 
@@ -376,6 +411,7 @@ THINX_ENV_HASH=...              # optional env_hash reported at check-in
 THINX_FIRMWARE_DIR=./firmware   # where OTT downloads are stored
 THINX_AUTO_DOWNLOAD_FIRMWARE=true
 THINX_ADOPT_DOWNLOADED_VERSION=false
+THINX_AUTO_CONNECT_MQTT=true    # connect MQTT after each check-in
 ```
 
 Set `THINX_API_PORT=7443` if you need to target an older THiNX deployment that still exposes the firmware-era API port.

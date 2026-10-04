@@ -18,7 +18,7 @@ function tool(name, description, inputSchema) {
 }
 
 const tools = [
-  tool("thinx_register", "Register this emulated THiNX device and persist the returned UDID.", {
+  tool("thinx_register", "Register (check in) this emulated THiNX device, persist the returned UDID, then connect MQTT and listen on the device channel (unless connectMqtt is false).", {
     type: "object",
     additionalProperties: false,
     properties: {
@@ -46,6 +46,10 @@ const tools = [
       adoptVersion: {
         type: "boolean",
         description: "After an automatic download, report the downloaded version on later check-ins (simulates a successful install)."
+      },
+      connectMqtt: {
+        type: "boolean",
+        description: "Connect MQTT and subscribe to the device channel after a successful check-in. Defaults to config autoConnectMqtt (true)."
       }
     }
   }),
@@ -58,7 +62,13 @@ const tools = [
       mqttHost: { type: "string", description: "MQTT host override." },
       mqttPort: { type: ["number", "string"], description: "MQTT port override. 1883 for MQTT, 8883 for MQTTS." },
       mqttProtocol: { type: "string", enum: ["mqtt", "mqtts"], description: "MQTT protocol override." },
-      subscribeWildcard: { type: "boolean", description: "Subscribe to /owner/udid/# in addition to /owner/udid." },
+      subscribeShared: { type: "boolean", description: "Subscribe to /owner/shared/# (granted by the device ACL). Defaults to true." },
+      subscribeWildcard: {
+        type: "boolean",
+        description: "Also subscribe to /owner/udid/#. Not in the default device ACL; a refusal is reported in subscriptions. Defaults to false."
+      },
+      connectAttempts: { type: "number", description: "Connection attempts before giving up. Defaults to 3." },
+      retryDelayMs: { type: "number", description: "Delay between attempts in milliseconds. Defaults to 2000." },
       timeoutMs: { type: "number", description: "Connection timeout in milliseconds." }
     }
   }),

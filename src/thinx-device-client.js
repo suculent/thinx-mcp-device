@@ -185,6 +185,10 @@ export class ThinxDeviceClient extends EventEmitter {
     this.messages = [];
     this.mqttClient = undefined;
     this.mqttConnected = false;
+    this.mqttConnecting = undefined; // in-flight connectMqtt promise
+    this.mqttSubscriptions = []; // [{ topic, granted, qos }]
+    this.lastMqttError = undefined;
+    this.mqttConnectImpl = options.mqttConnect || ((url, opts) => mqtt.connect(url, opts));
     this.checkinTimer = undefined;
     this.fetchImpl = options.fetch || ((...args) => fetch(...args));
     this.session = {}; // cached owner login: { accessToken, refreshToken, expiresAt, loggedInAt }
@@ -249,6 +253,12 @@ export class ThinxDeviceClient extends EventEmitter {
       firmwareDir: options.firmwareDir || process.env.THINX_FIRMWARE_DIR || fileConfig.firmwareDir || DEFAULT_FIRMWARE_DIR,
       autoDownloadFirmware: parseBoolean(
         options.autoDownloadFirmware ?? process.env.THINX_AUTO_DOWNLOAD_FIRMWARE ?? fileConfig.autoDownloadFirmware,
+        true
+      ),
+      // Connect MQTT and listen on the device channel after every successful
+      // check-in, like THiNXLib does after registration.
+      autoConnectMqtt: parseBoolean(
+        options.autoConnectMqtt ?? process.env.THINX_AUTO_CONNECT_MQTT ?? fileConfig.autoConnectMqtt,
         true
       ),
       adoptDownloadedVersion: parseBoolean(
@@ -321,6 +331,24 @@ export class ThinxDeviceClient extends EventEmitter {
 
   get statusChannel() {
     return this.deviceChannel ? `${this.deviceChannel}/status` : undefined;
+  }
+
+  get sharedChannel() {
+    return this.ownerId ? `/${this.ownerId}/shared/#` : undefined;
+  }
+
+  // Topics the broker ACL grants a device (device.js authorize_mqtt):
+  // /owner/udid, /owner/udid/status and /owner/shared/#. /owner/udid/# is not
+  // granted; it is only added on explicit request and reported if refused.
+  subscriptionTopics(overrides = {}) {
+    const topics = [this.deviceChannel];
+    if (overrides.subscribeShared !== false) {
+      topics.push(this.sharedChannel);
+    }
+    if (overrides.subscribeWildcard === true) {
+      topics.push(`${this.deviceChannel}/#`);
+    }
+    return topics;
   }
 
   // Platform reported at check-in: an explicit thinx_register argument is
@@ -438,10 +466,12 @@ export class ThinxDeviceClient extends EventEmitter {
     const registration = this.applyRegistrationResponse(payload);
     this.emit("registered", registration);
     const firmwareDownload = await this.handleFirmwareUpdate(registration, "registration", overrides);
+    const mqttResult = await this.connectAfterCheckin(overrides);
     return {
       url: url.toString(),
       registration: { ...registration, ...(registration.ott ? { ott: redactSecret(registration.ott) } : {}) },
       ...(firmwareDownload ? { firmwareDownload } : {}),
+      ...(mqttResult ? { mqtt: mqttResult } : {}),
       state: this.safeState()
     };
   }
@@ -515,7 +545,35 @@ export class ThinxDeviceClient extends EventEmitter {
     return this.register(overrides);
   }
 
+  // Called after every successful check-in. Never throws: a broker problem
+  // must not fail the registration. An existing client (connected or
+  // auto-reconnecting) is left alone, so check-ins never open a second one.
+  async connectAfterCheckin(overrides = {}) {
+    const enabled = overrides.connectMqtt ?? this.config.autoConnectMqtt;
+    if (!enabled) {
+      return undefined;
+    }
+    if (this.mqttClient && !this.mqttConnecting) {
+      return this.mqttSummary();
+    }
+    try {
+      return await this.connectMqtt({ ...overrides, autoRegister: false });
+    } catch (error) {
+      return { ...this.mqttSummary(), error: error.message };
+    }
+  }
+
   async connectMqtt(overrides = {}) {
+    if (this.mqttConnecting) {
+      return this.mqttConnecting;
+    }
+    this.mqttConnecting = this.connectMqttWithRetry(overrides).finally(() => {
+      this.mqttConnecting = undefined;
+    });
+    return this.mqttConnecting;
+  }
+
+  async connectMqttWithRetry(overrides = {}) {
     this.reloadConfig(overrides);
     this.validateCredentials();
 
@@ -523,33 +581,50 @@ export class ThinxDeviceClient extends EventEmitter {
       if (overrides.autoRegister === false) {
         throw new Error("Device has no UDID yet. Call thinx_register first or allow auto_register.");
       }
-      await this.register(overrides);
+      // connectMqtt: false — this call is already connecting.
+      await this.register({ ...overrides, connectMqtt: false });
     }
 
     if (this.mqttClient && this.mqttConnected) {
       return this.mqttSummary();
     }
 
+    // The backend writes the MQTT credentials (username = udid, password =
+    // api key) to Redis asynchronously during check-in, so the first connect
+    // right after a registration can be refused. Retry a few times.
+    const attempts = Math.max(1, Number(overrides.connectAttempts ?? 3));
+    const retryDelayMs = Number(overrides.retryDelayMs ?? 2000);
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await this.connectMqttOnce(overrides);
+        this.lastMqttError = undefined;
+        this.startCheckinTimer();
+        return this.mqttSummary();
+      } catch (error) {
+        lastError = error;
+        this.lastMqttError = { message: error.message, attempt, at: new Date().toISOString() };
+        if (attempt < attempts) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+        }
+      }
+    }
+    throw new Error(`MQTT connection failed after ${attempts} attempt(s): ${lastError.message}`);
+  }
+
+  connectMqttOnce(overrides = {}) {
     const url = buildMqttUrl(this.config, overrides);
     const statusChannel = this.statusChannel;
-    const deviceChannel = this.deviceChannel;
-    const subscriptions =
-      overrides.subscribeWildcard === false ? [deviceChannel] : [deviceChannel, `${deviceChannel}/#`];
+    const topics = this.subscriptionTopics(overrides);
 
-    await new Promise((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let settled = false;
-      const timeout = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          reject(new Error(`MQTT connection timed out for ${url}.`));
-        }
-      }, Number(overrides.timeoutMs || 20000));
-
-      const client = mqtt.connect(url, {
+      const client = this.mqttConnectImpl(url, {
         clientId: this.mac,
         clean: false,
         keepalive: 45,
         reconnectPeriod: Number(overrides.reconnectPeriodMs || 30000),
+        connectTimeout: Number(overrides.timeoutMs || 20000),
         username: this.udid,
         password: this.config.apiKey,
         will: {
@@ -560,17 +635,45 @@ export class ThinxDeviceClient extends EventEmitter {
         }
       });
 
+      const fail = (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        // Drop the half-open client so it does not keep reconnecting with a
+        // refused session alongside the next attempt.
+        client.end(true);
+        if (this.mqttClient === client) {
+          this.mqttClient = undefined;
+        }
+        this.mqttConnected = false;
+        reject(error);
+      };
+
+      const timeout = setTimeout(
+        () => fail(new Error(`MQTT connection timed out for ${url}.`)),
+        Number(overrides.timeoutMs || 20000)
+      );
+
       this.mqttClient = client;
 
+      // Runs on the first connect and on every automatic reconnect.
       client.on("connect", () => {
         this.mqttConnected = true;
-        client.subscribe(subscriptions, { qos: 0 }, (error) => {
+        client.subscribe(topics, { qos: 0 }, (error, granted = []) => {
           if (error) {
-            if (!settled) {
-              settled = true;
-              clearTimeout(timeout);
-              reject(error);
-            }
+            fail(error);
+            return;
+          }
+          // SUBACK 128 (0x80) or >= 0x80 under MQTT 5 means the ACL refused it.
+          this.mqttSubscriptions = topics.map((topic) => {
+            const grant = granted.find((entry) => entry.topic === topic);
+            const qos = grant ? grant.qos : undefined;
+            return { topic, qos, granted: qos !== undefined && qos < 128 };
+          });
+          if (!this.mqttSubscriptions.find((entry) => entry.topic === this.deviceChannel)?.granted) {
+            fail(new Error(`Broker refused subscription to ${this.deviceChannel}.`));
             return;
           }
 
@@ -609,12 +712,9 @@ export class ThinxDeviceClient extends EventEmitter {
       });
 
       client.on("error", (error) => {
+        this.lastMqttError = { message: error.message, at: new Date().toISOString() };
         this.emit("mqtt-error", error);
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          reject(error);
-        }
+        fail(error);
       });
 
       client.on("close", () => {
@@ -622,7 +722,11 @@ export class ThinxDeviceClient extends EventEmitter {
         this.emit("mqtt-closed");
       });
     });
+  }
 
+  // Periodic check-in, as THiNXLib does. Registration reconnects MQTT if the
+  // client was dropped; an existing client reconnects on its own.
+  startCheckinTimer() {
     if (this.config.checkinIntervalSeconds > 0 && !this.checkinTimer) {
       this.checkinTimer = setInterval(() => {
         this.register().catch((error) => {
@@ -631,8 +735,6 @@ export class ThinxDeviceClient extends EventEmitter {
       }, this.config.checkinIntervalSeconds * 1000);
       this.checkinTimer.unref();
     }
-
-    return this.mqttSummary();
   }
 
   mqttSummary() {
@@ -643,7 +745,8 @@ export class ThinxDeviceClient extends EventEmitter {
       username: this.udid,
       deviceChannel: this.deviceChannel,
       statusChannel: this.statusChannel,
-      subscriptions: this.deviceChannel ? [this.deviceChannel, `${this.deviceChannel}/#`] : []
+      subscriptions: this.mqttSubscriptions,
+      lastError: this.lastMqttError || null
     };
   }
 
@@ -671,6 +774,11 @@ export class ThinxDeviceClient extends EventEmitter {
     if (!this.mqttClient) {
       this.mqttConnected = false;
       return { connected: false };
+    }
+    // A clean disconnect suppresses the last will, so publish it ourselves;
+    // end(false) flushes it before closing.
+    if (this.mqttConnected && this.statusChannel) {
+      this.mqttClient.publish(this.statusChannel, JSON.stringify({ status: "disconnected" }), { qos: 0, retain: true });
     }
     this.mqttClient.end(false);
     this.mqttClient = undefined;
@@ -1011,6 +1119,9 @@ export class ThinxDeviceClient extends EventEmitter {
         : null,
       lastFirmwareDownload: this.state.lastFirmwareDownload || null,
       mqttConnected: this.mqttConnected,
+      autoConnectMqtt: this.config.autoConnectMqtt,
+      mqttSubscriptions: this.mqttSubscriptions,
+      lastMqttError: this.lastMqttError || null,
       deviceChannel: this.deviceChannel,
       statusChannel: this.statusChannel,
       apiBaseUrl: this.apiBaseUrl(),

@@ -242,7 +242,8 @@ const DEVICE_OPTS = {
   apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   ownerId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   cloudUrl: "https://app.thinx.cloud",
-  mac: "5CCF7F123456"
+  mac: "5CCF7F123456",
+  autoConnectMqtt: false
 };
 const UDID = "11111111-2222-3333-4444-555555555555";
 const OTT = "c".repeat(64);
@@ -392,4 +393,162 @@ test("requestOtt surfaces a refusal", async () => {
   const client = new ThinxDeviceClient({ ...DEVICE_OPTS, statePath: tempPath("state.json"), fetch: fetchImpl });
   client.state.udid = UDID;
   await assert.rejects(() => client.requestOtt(), /OTT_API_KEY_NOT_VALID/);
+});
+
+//
+// MQTT
+//
+
+import { EventEmitter } from "node:events";
+
+// Fake mqtt.js client: connects on the next tick (or errors), grants or
+// refuses (qos 128) subscriptions per topic, records publishes.
+function fakeMqtt({ failConnects = 0, refuse = [] } = {}) {
+  const clients = [];
+  const connect = (url, options) => {
+    const client = new EventEmitter();
+    client.url = url;
+    client.options = options;
+    client.published = [];
+    client.ended = false;
+    client.subscribe = (topics, _opts, callback) => {
+      client.topics = topics;
+      callback(null, topics.map((topic) => ({ topic, qos: refuse.includes(topic) ? 128 : 0 })));
+    };
+    client.publish = (topic, payload, opts) => client.published.push({ topic, payload, opts });
+    client.end = () => {
+      client.ended = true;
+    };
+    clients.push(client);
+    setImmediate(() => {
+      if (clients.length <= failConnects) {
+        client.emit("error", new Error("Connection refused: Not authorized"));
+      } else {
+        client.emit("connect");
+      }
+    });
+    return client;
+  };
+  connect.clients = clients;
+  return connect;
+}
+
+const OWNER = DEVICE_OPTS.ownerId;
+const registerOk = () =>
+  deviceFetch({
+    "POST https://app.thinx.cloud/device/register": {
+      text: JSON.stringify({ registration: { success: true, status: "OK", owner: OWNER, udid: UDID } })
+    }
+  });
+
+test("registration connects MQTT and listens on the ACL-granted device topics", async () => {
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    autoConnectMqtt: true,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+
+  const result = await client.register({ platform: "platformio" });
+
+  assert.equal(mqttConnect.clients.length, 1);
+  const [mqttClient] = mqttConnect.clients;
+  assert.equal(mqttClient.url, "mqtt://thinx.cloud:1883");
+  assert.equal(mqttClient.options.username, UDID);
+  assert.equal(mqttClient.options.password, DEVICE_OPTS.apiKey);
+  assert.equal(mqttClient.options.clientId, "5CCF7F123456");
+  assert.equal(mqttClient.options.will.topic, `/${OWNER}/${UDID}/status`);
+  assert.deepEqual(mqttClient.topics, [`/${OWNER}/${UDID}`, `/${OWNER}/shared/#`]);
+  assert.equal(result.mqtt.connected, true);
+  assert.ok(result.mqtt.subscriptions.every((entry) => entry.granted));
+  assert.deepEqual(mqttClient.published[0], {
+    topic: `/${OWNER}/${UDID}/status`,
+    payload: JSON.stringify({ status: "connected" }),
+    opts: { qos: 0, retain: true }
+  });
+
+  // A later check-in reuses the existing client.
+  await client.register();
+  assert.equal(mqttConnect.clients.length, 1);
+});
+
+test("MQTT connect retries while the backend is still writing credentials", async () => {
+  const mqttConnect = fakeMqtt({ failConnects: 2 });
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+
+  const summary = await client.connectMqtt({ retryDelayMs: 1 });
+
+  assert.equal(summary.connected, true);
+  assert.equal(mqttConnect.clients.length, 3);
+  assert.ok(mqttConnect.clients[0].ended && mqttConnect.clients[1].ended);
+  assert.equal(client.safeState().lastMqttError, null);
+});
+
+test("MQTT failure does not fail the registration", async () => {
+  const mqttConnect = fakeMqtt({ failConnects: 99 });
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    autoConnectMqtt: true,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+
+  const result = await client.register({ retryDelayMs: 1 });
+
+  assert.equal(result.registration.udid, UDID);
+  assert.equal(result.mqtt.connected, false);
+  assert.match(result.mqtt.error, /after 3 attempt\(s\): Connection refused/);
+  assert.equal(client.mqttClient, undefined);
+});
+
+test("a refused /owner/udid/# subscription is reported, not fatal", async () => {
+  const wildcard = `/${OWNER}/${UDID}/#`;
+  const mqttConnect = fakeMqtt({ refuse: [wildcard] });
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+
+  const summary = await client.connectMqtt({ subscribeWildcard: true });
+
+  assert.equal(summary.connected, true);
+  assert.deepEqual(summary.subscriptions.find((entry) => entry.topic === wildcard), { topic: wildcard, qos: 128, granted: false });
+});
+
+test("MQTT messages on the device channel are buffered and OTTs picked up", async () => {
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    autoDownloadFirmware: false,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+  await client.connectMqtt();
+
+  const [mqttClient] = mqttConnect.clients;
+  const push = { registration: { status: "FIRMWARE_UPDATE", ott: OTT, version: "3.0.0" } };
+  mqttClient.emit("message", `/${OWNER}/${UDID}`, Buffer.from(JSON.stringify(push)), { retain: false });
+  mqttClient.emit("message", `/${OWNER}/${UDID}/status`, Buffer.from("{}"), {});
+
+  const messages = client.recentMessages();
+  assert.equal(messages.length, 1);
+  assert.deepEqual(messages[0].json, push);
+  assert.equal(client.state.pendingUpdate.ott, OTT);
+  assert.equal(client.state.pendingUpdate.source, "mqtt");
 });
