@@ -1,0 +1,19 @@
+{
+  "name": "thinx-mcp-device",
+  "version": "0.1.0",
+  "description": "Simple MCP server that emulates a THiNX device registration and MQTT client.",
+  "type": "module",
+  "bin": {
+    "thinx-mcp-device": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/thinx-device-client.test.js"
+  },
+  "dependencies": {
+    "mqtt": "^5.10.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

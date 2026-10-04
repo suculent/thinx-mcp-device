@@ -1,0 +1,19 @@
+{
+  "apiKey": "132b5b3bb3d43c5ab6b01621b52f0484420219b418ba2bb8175f03c3f20db546",
+  "ownerId": "cedc16bb6bb06daaa3ff6d30666d91aacd6e3efbf9abbc151b4dcade59af7c12",
+  "cloudUrl": "https://app.thinx.cloud",
+  "registerPath": "/device/register",
+  "mqttHost": "thinx.cloud",
+  "mqttPort": 1883,
+  "mqttProtocol": "mqtt",
+  "alias": "thinx-mcp-device",
+  "appVersion": "thinx-mcp-device:0.1.0",
+  "firmwareVersion": "thinx-mcp-device:0.1.0",
+  "firmwareVersionShort": "0.1.0",
+  "commitId": "0",
+  "platform": "nodejs:mcp",
+  "autoUpdate": false,
+  "forcedUpdate": false,
+  "networkInterfaces": ["en0", "eth0", "wlan0"],
+  "checkinIntervalSeconds": 300
+}
