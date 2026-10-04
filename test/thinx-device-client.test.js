@@ -627,10 +627,45 @@ test("a reconnect whose re-subscribe returns no new grants keeps the subscriptio
   await client.connectMqtt();
   assert.ok(client.safeState().mqttSubscriptions.every((s) => s.granted));
 
-  // Automatic reconnect: mqtt.js fires "connect" again.
+  // Automatic reconnect: mqtt.js fires "close" then "connect" again.
+  connect.clients[0].emit("close");
   connect.clients[0].emit("connect");
   await new Promise((resolve) => setImmediate(resolve));
 
   const subs = client.safeState().mqttSubscriptions;
+  assert.equal(subs.length, 2);
   assert.ok(subs.every((s) => s.granted), "subscriptions should stay granted after a reconnect");
+});
+
+test("a disconnect clears the reported subscriptions (no stale granted:true)", async () => {
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+  await client.connectMqtt();
+  assert.equal(client.safeState().mqttSubscriptions.length, 2);
+
+  // A dropped connection must not leave stale granted:true in status.
+  mqttConnect.clients[0].emit("close");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.safeState().mqttConnected, false);
+  assert.deepEqual(client.safeState().mqttSubscriptions, []);
+});
+
+test("an explicit disconnect clears the reported subscriptions", async () => {
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect
+  });
+  await client.connectMqtt();
+  client.disconnectMqtt();
+  assert.deepEqual(client.safeState().mqttSubscriptions, []);
 });

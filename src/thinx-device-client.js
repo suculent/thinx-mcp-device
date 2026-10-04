@@ -232,7 +232,8 @@ export class ThinxDeviceClient extends EventEmitter {
     this.mqttClient = undefined;
     this.mqttConnected = false;
     this.mqttConnecting = undefined; // in-flight connectMqtt promise
-    this.mqttSubscriptions = []; // [{ topic, granted, qos }]
+    this.mqttSubscriptions = []; // active subscriptions [{ topic, granted, qos }]; empty while disconnected
+    this.grantedTopics = []; // last grants, kept across a reconnect to repopulate the short-circuited resubscribe
     this.lastMqttError = undefined;
     this.mqttConnectImpl = options.mqttConnect || ((url, opts) => mqtt.connect(url, opts));
     this.checkinTimer = undefined;
@@ -727,8 +728,8 @@ export class ThinxDeviceClient extends EventEmitter {
           }
           // On an automatic reconnect our repeat subscribe is short-circuited by
           // mqtt.js (the topics are already tracked for its own auto-resubscribe),
-          // so it calls back with an empty granted array. Keep the grants captured
-          // on the first connect instead of overwriting them with "refused".
+          // so it calls back with an empty granted array. Restore the grants
+          // captured on the first connect instead of leaving the topics unlisted.
           // SUBACK 128 (0x80) or >= 0x80 under MQTT 5 means the ACL refused it.
           if (granted.length > 0) {
             this.mqttSubscriptions = topics.map((topic, index) => {
@@ -738,6 +739,9 @@ export class ThinxDeviceClient extends EventEmitter {
               const qos = grant ? grant.qos : undefined;
               return { topic, qos, granted: qos !== undefined && qos < 128 };
             });
+            this.grantedTopics = this.mqttSubscriptions;
+          } else {
+            this.mqttSubscriptions = this.grantedTopics;
           }
           if (!this.mqttSubscriptions.find((entry) => entry.topic === this.deviceChannel)?.granted) {
             fail(new Error(`Broker refused subscription to ${this.deviceChannel}.`));
@@ -795,6 +799,9 @@ export class ThinxDeviceClient extends EventEmitter {
 
       client.on("close", () => {
         this.mqttConnected = false;
+        // No active subscriptions while disconnected; grantedTopics is kept so an
+        // automatic reconnect can repopulate the short-circuited resubscribe.
+        this.mqttSubscriptions = [];
         this.emit("mqtt-closed");
       });
     });
@@ -948,6 +955,10 @@ export class ThinxDeviceClient extends EventEmitter {
     this.mqttClient.end(false);
     this.mqttClient = undefined;
     this.mqttConnected = false;
+    // Intentional disconnect: forget subscriptions entirely (a later fresh
+    // connect gets real grants from a non-short-circuited subscribe).
+    this.mqttSubscriptions = [];
+    this.grantedTopics = [];
     return { connected: false };
   }
 
