@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import mqtt from "mqtt";
 
 import { DEFAULT_INO_PATH, readInoCredentials, redactSecret } from "./credentials.js";
+import { evaluateCommand, DEFAULT_ALLOW } from "./command-policy.js";
+import { createCommandRunner } from "./command-runner.js";
 
 const DEFAULT_CONFIG_PATH = fileURLToPath(new URL("../thinx-device.config.json", import.meta.url));
 const DEFAULT_STATE_PATH = fileURLToPath(new URL("../.thinx-device-state.json", import.meta.url));
@@ -20,6 +22,9 @@ const DEFAULT_MCU = "esp32";
 // Platforms THiNX builds a single firmware.bin for and serves via OTT
 // (device.js updateFromPath). Firmware reports them as "<platform>:<mcu>".
 export const FIRMWARE_PLATFORMS = ["arduino", "platformio"];
+
+// Most commands run or queued at once before new ones are refused as "busy".
+const MAX_PENDING_COMMANDS = 10;
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
@@ -69,6 +74,38 @@ function readJsonFile(filePath, fallback) {
 
 function usableMac(entry) {
   return entry && !entry.internal && entry.mac && entry.mac !== "00:00:00:00:00:00";
+}
+
+// Comma-separated string or array -> trimmed non-empty array.
+function parseList(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return value.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+// Remote command-execution settings (src/command-policy.js + command-runner.js).
+// Docker-sandboxed and enabled by default; host mode must be chosen explicitly.
+function resolveCommandsConfig(options, fileConfig) {
+  const c = options.commands || fileConfig.commands || {};
+  const d = c.docker || {};
+  return {
+    enabled: parseBoolean(options.commandsEnabled ?? process.env.THINX_CMD_ENABLED ?? c.enabled, true),
+    mode: options.commandMode || process.env.THINX_CMD_MODE || c.mode || "docker",
+    docker: {
+      image: options.commandImage || process.env.THINX_CMD_IMAGE || d.image || "dhi.io/alpine-base:3.24",
+      network: d.network || "none",
+      readOnly: d.readOnly !== false,
+      user: d.user || "65534:65534",
+      memory: d.memory || "128m",
+      pidsLimit: Number(d.pidsLimit) || 64,
+      extraArgs: Array.isArray(d.extraArgs) ? d.extraArgs : []
+    },
+    allow: parseList(process.env.THINX_CMD_ALLOW).concat(parseList(c.allow)),
+    deny: parseList(process.env.THINX_CMD_DENY).concat(parseList(c.deny)),
+    useDefaultAllow: parseBoolean(c.useDefaultAllow, true),
+    timeoutMs: Number(options.commandTimeoutMs || process.env.THINX_CMD_TIMEOUT_MS || c.timeoutMs) || 10000,
+    maxOutputBytes: Number(c.maxOutputBytes) || 65536
+  };
 }
 
 export function selectHardwareMac(interfaces = os.networkInterfaces(), preferredNames = DEFAULT_NETWORK_INTERFACES) {
@@ -201,6 +238,11 @@ export class ThinxDeviceClient extends EventEmitter {
     this.checkinTimer = undefined;
     this.fetchImpl = options.fetch || ((...args) => fetch(...args));
     this.session = {}; // cached owner login: { accessToken, refreshToken, expiresAt, loggedInAt }
+    // Remote command execution: lazy runner, a serial chain and an in-flight cap.
+    this.spawnImpl = options.spawn;
+    this.commandRunner = undefined;
+    this.commandChain = Promise.resolve();
+    this.pendingCommands = 0;
     this.config = this.resolveConfig(options);
   }
 
@@ -294,7 +336,9 @@ export class ThinxDeviceClient extends EventEmitter {
       ownerPassword: options.ownerPassword || process.env.THINX_OWNER_PASS || fileConfig.ownerPassword,
       // Base URL for the owner /api/v2 calls. Defaults to cloudUrl; override
       // when the console is served from a different host than registration.
-      apiUrl: options.apiUrl || process.env.THINX_API_URL || fileConfig.apiUrl
+      apiUrl: options.apiUrl || process.env.THINX_API_URL || fileConfig.apiUrl,
+      // Remote command execution over MQTT / the thinx_exec tool.
+      commands: resolveCommandsConfig(options, fileConfig)
     };
   }
 
@@ -344,6 +388,12 @@ export class ThinxDeviceClient extends EventEmitter {
 
   get sharedChannel() {
     return this.ownerId ? `/${this.ownerId}/shared/#` : undefined;
+  }
+
+  // Command replies go here. Under /owner/shared/#, which authorize_mqtt grants
+  // the device readwrite, so no server ACL change is needed to publish.
+  get consoleChannel() {
+    return this.ownerId && this.udid ? `/${this.ownerId}/shared/${this.udid}/console` : undefined;
   }
 
   // Topics the broker ACL grants a device (device.js authorize_mqtt):
@@ -699,7 +749,8 @@ export class ThinxDeviceClient extends EventEmitter {
 
       client.on("message", (topic, payloadBuffer, packet) => {
         const payload = payloadBuffer.toString("utf8");
-        if (topic === statusChannel) {
+        if (topic === statusChannel || topic === this.consoleChannel) {
+          // Our own status / command replies, echoed back over shared/#.
           return;
         }
         const message = {
@@ -717,6 +768,14 @@ export class ThinxDeviceClient extends EventEmitter {
         if (update) {
           this.recordPendingUpdate(update, "mqtt");
           this.handleFirmwareUpdate(update, "mqtt").catch((error) => this.emit("firmware-error", error));
+        }
+
+        // A command is accepted only from the device's own channel and never
+        // from a retained message (so an old command does not re-run on reconnect).
+        if (topic === this.deviceChannel && !packet?.retain && message.json && typeof message.json.cmd === "string") {
+          this.executeCommand(message.json.cmd, { source: "mqtt" })
+            .then((reply) => this.publishConsole(reply))
+            .catch((error) => this.emit("command-error", error));
         }
       });
 
@@ -757,6 +816,95 @@ export class ThinxDeviceClient extends EventEmitter {
       subscriptions: this.mqttSubscriptions,
       lastError: this.lastMqttError || null
     };
+  }
+
+  //
+  // Remote command execution
+  //
+  // A {"cmd": "..."} message on the device channel (or a thinx_exec call) runs
+  // the command through command-policy and command-runner, then replies on the
+  // console channel. Commands run one at a time, in order.
+  //
+
+  getCommandRunner() {
+    if (!this.commandRunner) {
+      this.commandRunner = createCommandRunner(
+        { ...this.config.commands, udid: this.udid },
+        { spawn: this.spawnImpl }
+      );
+    }
+    return this.commandRunner;
+  }
+
+  async closeCommandRunner() {
+    if (this.commandRunner) {
+      await this.commandRunner.close();
+      this.commandRunner = undefined;
+    }
+  }
+
+  async executeCommand(command, { source = "tool" } = {}) {
+    const base = { udid: this.udid, cmd: command, source, at: new Date().toISOString() };
+    const cfg = this.config.commands;
+    if (!cfg.enabled) {
+      return { ...base, status: "disabled", reason: "command execution is disabled" };
+    }
+    if (cfg.mode !== "docker" && cfg.mode !== "host") {
+      return { ...base, status: "disabled", reason: `unknown command mode "${cfg.mode}"` };
+    }
+    const policy = evaluateCommand(command, cfg);
+    if (!policy.allowed) {
+      return { ...base, status: "refused", reason: policy.reason, segment: policy.segment };
+    }
+    if (this.pendingCommands >= MAX_PENDING_COMMANDS) {
+      return { ...base, status: "busy", reason: `too many pending commands (max ${MAX_PENDING_COMMANDS})` };
+    }
+
+    this.pendingCommands++;
+    const task = this.commandChain.then(() => this.getCommandRunner().run(command));
+    this.commandChain = task.then(() => {}, () => {}); // keep the chain alive past failures
+    let reply;
+    try {
+      const r = await task;
+      reply = {
+        ...base,
+        status: r.timedOut ? "timeout" : "ok",
+        exitCode: r.exitCode,
+        stdout: r.stdout,
+        stderr: r.stderr,
+        timedOut: r.timedOut,
+        truncated: r.truncated,
+        durationMs: r.durationMs
+      };
+    } catch (err) {
+      reply = (err && err.code === "DOCKER_UNAVAILABLE")
+        ? { ...base, status: "unavailable", message: err.message }
+        : { ...base, status: "error", message: err ? err.message : "unknown error" };
+    } finally {
+      this.pendingCommands--;
+    }
+    this.emit("command-run", reply);
+    return reply;
+  }
+
+  // thinx_exec entry point: dryRun returns only the policy decision.
+  async dispatchCommand(command, { dryRun = false } = {}) {
+    if (typeof command !== "string" || command.trim() === "") {
+      return { cmd: command, status: "refused", reason: "empty command" };
+    }
+    if (dryRun) {
+      return { cmd: command, dryRun: true, ...evaluateCommand(command, this.config.commands) };
+    }
+    return this.executeCommand(command, { source: "tool" });
+  }
+
+  publishConsole(reply) {
+    if (!this.mqttClient || !this.mqttConnected || !this.consoleChannel) {
+      return undefined;
+    }
+    const payload = JSON.stringify(reply);
+    this.mqttClient.publish(this.consoleChannel, payload, { qos: 0, retain: false });
+    return { topic: this.consoleChannel, payload };
   }
 
   publishStatus(message, options = {}) {
@@ -1172,6 +1320,18 @@ export class ThinxDeviceClient extends EventEmitter {
       apiBaseUrl: this.apiBaseUrl(),
       ownerCredentialsConfigured: Boolean(this.config.ownerUsername && this.config.ownerPassword),
       ownerTokenConfigured: Boolean(this.config.ownerToken),
+      commands: {
+        enabled: this.config.commands.enabled,
+        mode: this.config.commands.mode,
+        image: this.config.commands.docker.image,
+        useDefaultAllow: this.config.commands.useDefaultAllow,
+        allow: this.config.commands.allow,
+        deny: this.config.commands.deny,
+        defaultAllow: DEFAULT_ALLOW,
+        pending: this.pendingCommands,
+        consoleChannel: this.consoleChannel,
+        runner: this.commandRunner ? this.commandRunner.status() : null
+      },
       ownerSession: this.session.accessToken
         ? {
             loggedInAt: this.session.loggedInAt,

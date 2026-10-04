@@ -178,6 +178,19 @@ const tools = [
         merge: { type: "boolean", description: "Merge with existing environment (default true). Set false to replace it entirely." }
       }
     }
+  ),
+  tool(
+    "thinx_exec",
+    "Run a shell command through the device command sandbox (Docker by default; host shell only when explicitly configured) and return stdout/stderr/exit code. Applies the same allow-list policy as MQTT cmd messages; does not publish to MQTT.",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["command"],
+      properties: {
+        command: { type: "string", description: "Shell command to run in the sandbox." },
+        dryRun: { type: "boolean", description: "Only return the allow/deny decision without running anything." }
+      }
+    }
   )
 ];
 
@@ -229,6 +242,8 @@ export class McpJsonRpcServer {
         return textResult(await this.client.getEnvironment(args));
       case "thinx_set_environment":
         return textResult(await this.client.setEnvironment(args.environment, args));
+      case "thinx_exec":
+        return textResult(await this.client.dispatchCommand(args.command, { dryRun: args.dryRun }));
       default:
         return textResult(`Unknown tool: ${name}`, true);
     }
@@ -266,6 +281,7 @@ export class McpJsonRpcServer {
           return;
         case "shutdown":
           this.client.disconnectMqtt();
+          await this.client.closeCommandRunner();
           this.sendResult(id, {});
           return;
         default:
@@ -335,6 +351,23 @@ export class McpJsonRpcServer {
     this.client.on("firmware-downloaded", (download) => {
       process.stderr.write(`[thinx-mcp-device] Firmware stored: ${download.path} (${download.size} bytes, md5 ${download.md5})\n`);
     });
+
+    this.client.on("command-run", (reply) => {
+      process.stderr.write(`[thinx-mcp-device] command (${reply.source}) ${reply.status} exit=${reply.exitCode ?? "-"}: ${reply.cmd}\n`);
+    });
+
+    this.client.on("command-error", (error) => {
+      process.stderr.write(`[thinx-mcp-device] Command error: ${error.message}\n`);
+    });
+
+    // Containers created with --rm keep running if the process just exits, so
+    // tear the sandbox down on a signal before leaving.
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      process.on(signal, () => {
+        this.client.disconnectMqtt();
+        this.client.closeCommandRunner().finally(() => process.exit(0));
+      });
+    }
   }
 }
 

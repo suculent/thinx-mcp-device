@@ -55,6 +55,7 @@ For an MCP client, use:
 - `thinx_login`: logs in as the device owner and caches a session token.
 - `thinx_get_environment`: inspects the device's environment variables via `POST /api/v2/device`.
 - `thinx_set_environment`: sets environment variables via `PUT /api/v2/device` (merges by default).
+- `thinx_exec`: runs a shell command through the command sandbox and returns stdout/stderr/exit code (see [Remote commands](#remote-commands)).
 
 ### MQTT
 
@@ -90,6 +91,94 @@ Turn the automatic connect off with `autoConnectMqtt: false` in the config,
 `THINX_AUTO_CONNECT_MQTT=false`, or `connectMqtt: false` on a single
 `thinx_register` call. `thinx_status` shows `mqttConnected`, `mqttSubscriptions`
 and `lastMqttError`.
+
+### Remote commands
+
+The device can run shell commands it receives over MQTT and reply with the
+output. The same pipeline is available locally through the `thinx_exec` tool.
+
+**Receiving a command.** Publish a JSON object with a `cmd` string to the
+device channel `/<owner>/<udid>`:
+
+```json
+{ "cmd": "whoami" }
+```
+
+Only the device's own channel is accepted, and retained messages are ignored so
+a command left on the broker does not re-run when the device reconnects.
+
+**The reply** is published (not retained) to `/<owner>/shared/<udid>/console`.
+This topic sits under `/<owner>/shared/#`, which the backend's `authorize_mqtt`
+already grants the device `readwrite`, so no server change is needed:
+
+```json
+{
+  "udid": "af6eac20-…", "cmd": "whoami", "source": "mqtt",
+  "at": "2026-10-04T15:30:00.000Z", "status": "ok", "exitCode": 0,
+  "stdout": "nobody\n", "stderr": "", "timedOut": false,
+  "truncated": false, "durationMs": 112
+}
+```
+
+`status` is one of:
+
+| status | meaning |
+|---|---|
+| `ok` | ran; see `exitCode`, `stdout`, `stderr` (each stream capped at `maxOutputBytes`, `truncated` when cut) |
+| `timeout` | killed after `timeoutMs` |
+| `refused` | blocked by policy; see `reason` and `segment` |
+| `disabled` | command execution is off, or an unknown `mode` |
+| `unavailable` | Docker is not installed / not running (never falls back to the host) |
+| `busy` | more than 10 commands already queued |
+| `error` | an unexpected failure; see `message` |
+
+Commands run one at a time, in order.
+
+**Where commands run.** By default each command runs via `docker exec` in a
+long-lived, locked-down container (`dhi.io/alpine-base:3.24`): no network, a
+read-only root filesystem with a small writable `/tmp`, all capabilities
+dropped, no privilege escalation, a non-root user, and memory/pids limits. The
+container starts on the first command and is removed on shutdown.
+
+Setting `mode: "host"` runs commands directly on the host with `sh -c` — only
+when the operator sets it explicitly; it is never a silent fallback. In host
+mode, environment variables whose names look secret (`*PASS*`, `*TOKEN*`,
+`*KEY*`, `*SECRET*`) are stripped from the command's environment.
+
+**Permissions.** Every command is split on `;`, `&&`, `||`, `|`, `&` and
+newlines, and *every* segment must be allowed, in both Docker and host mode.
+Rules follow Claude's syntax:
+
+- `whoami` — exact match (that command with no arguments);
+- `ls *` — `ls` alone or `ls` followed by anything;
+- `foo*` — any command starting with `foo`.
+
+The default allow-list is read-only commands and harmless diagnostics:
+`whoami`, `id`, `hostname`, `pwd`, `uptime`, `date`, `env`, `printenv`, and
+`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `find`, `stat`, `uname`, `df`, `du`,
+`free`, `ps`, `echo`, `which`, `file`, `md5sum`, `sha256sum` with any arguments.
+Add your own with `allow`; `deny` always wins over `allow`; set
+`useDefaultAllow: false` to drop the defaults and allow only your own rules.
+
+An **always-on, non-configurable deny list** refuses, whatever the allow rules
+say: `rm -rf /` and its variants (any recursive+force remove of `/`, `/*`, `~`,
+`.`, `..`, or `--no-preserve-root`), `mkfs*`, `dd of=/dev/*`, `shutdown` /
+`reboot` / `halt` / `poweroff`, shell function definitions / the fork bomb,
+command and process substitution (`$(…)`, backticks, `<(…)`), output redirects
+(`>`, `>>`), and `find` with `-exec`/`-delete`. Input redirect (`<`) and stderr
+merge (`2>&1`) are allowed.
+
+**`thinx_exec`** runs the same pipeline and returns the reply object without
+publishing to MQTT. Pass `dryRun: true` to get only the allow/deny decision:
+
+```json
+{ "command": "cat /etc/hostname" }
+{ "command": "rm -rf /", "dryRun": true }
+```
+
+`thinx_status` shows a `commands` block: `enabled`, `mode`, `image`, the
+effective `allow`/`deny` rules, `defaultAllow`, how many commands are `pending`,
+the `consoleChannel`, and the `runner` container state.
 
 ### Acting as an Arduino / PlatformIO device (OTT firmware updates)
 
@@ -412,6 +501,36 @@ THINX_FIRMWARE_DIR=./firmware   # where OTT downloads are stored
 THINX_AUTO_DOWNLOAD_FIRMWARE=true
 THINX_ADOPT_DOWNLOADED_VERSION=false
 THINX_AUTO_CONNECT_MQTT=true    # connect MQTT after each check-in
+THINX_CMD_ENABLED=true          # remote command execution (on by default)
+THINX_CMD_MODE=docker           # docker (default) | host
+THINX_CMD_IMAGE=dhi.io/alpine-base:3.24
+THINX_CMD_ALLOW=chmod *,curl *  # extra allow rules (comma-separated)
+THINX_CMD_DENY=cat /etc/shadow  # extra deny rules (comma-separated)
+THINX_CMD_TIMEOUT_MS=10000      # per-command timeout
+```
+
+Remote command execution is configured under a `commands` block in
+`thinx-device.config.json` (see [Remote commands](#remote-commands)):
+
+```json
+"commands": {
+  "enabled": true,
+  "mode": "docker",
+  "docker": {
+    "image": "dhi.io/alpine-base:3.24",
+    "network": "none",
+    "readOnly": true,
+    "user": "65534:65534",
+    "memory": "128m",
+    "pidsLimit": 64,
+    "extraArgs": []
+  },
+  "allow": [],
+  "deny": [],
+  "useDefaultAllow": true,
+  "timeoutMs": 10000,
+  "maxOutputBytes": 65536
+}
 ```
 
 Set `THINX_API_PORT=7443` if you need to target an older THiNX deployment that still exposes the firmware-era API port.

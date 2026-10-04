@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/thinx-device-client.test.js"
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "mqtt": "^5.10.4"
