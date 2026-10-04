@@ -113,7 +113,12 @@ function mockFetch(routes) {
     if (!route) {
       return { ok: false, status: 404, text: async () => JSON.stringify({ success: false, error: "no_route" }) };
     }
-    return { ok: route.ok !== false, status: route.status || 200, text: async () => route.text };
+    const setCookie = route.setCookie || [];
+    const headers = {
+      get: (name) => (name.toLowerCase() === "set-cookie" && setCookie.length ? setCookie.join(", ") : null),
+      getSetCookie: () => setCookie
+    };
+    return { ok: route.ok !== false, status: route.status || 200, headers, text: async () => route.text };
   };
   fetchImpl.calls = calls;
   return fetchImpl;
@@ -188,10 +193,45 @@ function fakeJwt(expEpoch) {
   return `${seg({ alg: "HS512", typ: "JWT" })}.${seg({ username: "owner", exp: expEpoch })}.sig`;
 }
 
+const CSRF_PRIME = {
+  "GET https://console.thinx.cloud/api/v2/csrf-token": {
+    text: JSON.stringify({ success: true, response: { csrf_token: "xsrf-abc" } }),
+    setCookie: [
+      "XSRF-TOKEN=xsrf-abc; Domain=.thinx.cloud; Path=/; Secure; SameSite=Lax",
+      "x-thx-core=sess-123; Domain=.thinx.cloud; Path=/; HttpOnly; Secure; SameSite=Lax"
+    ]
+  }
+};
+
+test("ownerLogin primes the CSRF token and echoes it on the login POST", async () => {
+  const jwt = fakeJwt(Math.floor(Date.now() / 1000) + 3600);
+  const fetchImpl = mockFetch({
+    ...CSRF_PRIME,
+    "POST https://console.thinx.cloud/api/v2/login": {
+      text: JSON.stringify({ success: true, access_token: jwt, refresh_token: "r" })
+    }
+  });
+  const client = new ThinxDeviceClient({
+    statePath: tempPath("state.json"),
+    ownerUsername: "test",
+    ownerPassword: "tset",
+    apiUrl: "https://console.thinx.cloud",
+    fetch: fetchImpl
+  });
+
+  await client.ownerLogin();
+  assert.equal(fetchImpl.calls[0].url, "https://console.thinx.cloud/api/v2/csrf-token");
+  const login = fetchImpl.calls[1];
+  assert.equal(login.url, "https://console.thinx.cloud/api/v2/login");
+  assert.equal(login.headers["X-XSRF-TOKEN"], "xsrf-abc");
+  assert.equal(login.headers.Cookie, "XSRF-TOKEN=xsrf-abc; x-thx-core=sess-123");
+});
+
 test("ownerLogin posts credentials and caches the session token", async () => {
   const futureExp = Math.floor(Date.now() / 1000) + 3600;
   const jwt = fakeJwt(futureExp);
   const fetchImpl = mockFetch({
+    ...CSRF_PRIME,
     "POST https://console.thinx.cloud/api/v2/login": {
       text: JSON.stringify({ success: true, access_token: jwt, refresh_token: "refresh-xyz" })
     }
@@ -207,12 +247,13 @@ test("ownerLogin posts credentials and caches the session token", async () => {
   const session = await client.ownerLogin();
   assert.equal(session.accessToken, jwt);
   assert.equal(session.expiresAt, futureExp);
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].body), { username: "test", password: "tset" });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[1].body), { username: "test", password: "tset" });
 });
 
 test("getEnvironment auto-logs-in when only credentials are configured", async () => {
   const jwt = fakeJwt(Math.floor(Date.now() / 1000) + 3600);
   const fetchImpl = mockFetch({
+    ...CSRF_PRIME,
     "POST https://console.thinx.cloud/api/v2/login": {
       text: JSON.stringify({ success: true, access_token: jwt, refresh_token: "r" })
     },
@@ -230,8 +271,8 @@ test("getEnvironment auto-logs-in when only credentials are configured", async (
 
   const result = await client.getEnvironment({ udid: "udid-1" });
   assert.deepEqual(result.environment, { region: "eu" });
-  assert.equal(fetchImpl.calls[0].url, "https://console.thinx.cloud/api/v2/login");
-  assert.equal(fetchImpl.calls[1].headers.Authorization, `Bearer ${jwt}`);
+  assert.equal(fetchImpl.calls[1].url, "https://console.thinx.cloud/api/v2/login");
+  assert.equal(fetchImpl.calls[2].headers.Authorization, `Bearer ${jwt}`);
 });
 
 //

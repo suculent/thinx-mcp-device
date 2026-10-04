@@ -121,6 +121,15 @@ function tryJson(payload) {
   }
 }
 
+// Each Set-Cookie line of a fetch response. getSetCookie() keeps lines apart;
+// the joined get() fallback is split only before a new `name=` pair, because
+// Expires values contain commas.
+function readSetCookies(headers) {
+  if (typeof headers?.getSetCookie === "function") return headers.getSetCookie();
+  const joined = headers?.get?.("set-cookie");
+  return joined ? joined.split(/,\s*(?=[^;,=\s]+=)/) : [];
+}
+
 // THiNX sometimes wraps a rejected registration as
 // { success: false, response: "<JSON string containing { registration: ... }>" }.
 function unwrapRegistration(payload) {
@@ -958,6 +967,36 @@ export class ThinxDeviceClient extends EventEmitter {
     };
   }
 
+  // The API enforces double-submit CSRF on /api/v2/login: GET /api/v2/csrf-token
+  // sets XSRF-TOKEN plus the x-thx-core session cookie (the token is bound to that
+  // session in signed mode), and the login POST must send both cookies back with
+  // the token echoed in X-XSRF-TOKEN.
+  async primeCsrf(overrides = {}) {
+    const url = `${this.apiBaseUrl(overrides)}/api/v2/csrf-token`;
+    const response = await this.fetchImpl(url, { method: "GET", headers: { Accept: "application/json" } });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`CSRF token request failed with HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+
+    const cookies = {};
+    for (const line of readSetCookies(response.headers)) {
+      const pair = line.split(";")[0];
+      const eq = pair.indexOf("=");
+      if (eq > 0) cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+    }
+    const payload = tryJson(text);
+    const token = cookies["XSRF-TOKEN"] || payload?.response?.csrf_token || payload?.csrf_token;
+    if (!token) {
+      throw new Error("CSRF token request returned no XSRF-TOKEN.");
+    }
+    cookies["XSRF-TOKEN"] = token;
+    const cookie = Object.entries(cookies)
+      .map(([name, value]) => `${name}=${value}`)
+      .join("; ");
+    return { token, cookie };
+  }
+
   async ownerLogin(overrides = {}) {
     this.reloadConfig(overrides);
     const username = overrides.ownerUsername || this.config.ownerUsername;
@@ -968,10 +1007,16 @@ export class ThinxDeviceClient extends EventEmitter {
       );
     }
 
+    const csrf = await this.primeCsrf(overrides);
     const url = `${this.apiBaseUrl(overrides)}/api/v2/login`;
     const response = await this.fetchImpl(url, {
       method: "POST",
-      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Cookie: csrf.cookie,
+        "X-XSRF-TOKEN": csrf.token
+      },
       body: JSON.stringify({ username, password })
     });
     const text = await response.text();
