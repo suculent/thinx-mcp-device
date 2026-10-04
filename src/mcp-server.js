@@ -27,7 +27,26 @@ const tools = [
       apiPort: { type: ["number", "string"], description: "Optional API port override." },
       alias: { type: "string", description: "Optional device alias to report." },
       udid: { type: "string", description: "Optional existing UDID to report during check-in." },
-      mac: { type: "string", description: "Optional device MAC/client id override." }
+      mac: { type: "string", description: "Optional device MAC/client id override." },
+      platform: {
+        type: "string",
+        description:
+          "Platform to report, e.g. \"platformio\" or \"arduino\" (expanded to \"<platform>:<mcu>\"). Persisted for later check-ins. THiNX builds/serves OTT firmware only for arduino and platformio."
+      },
+      mcu: { type: "string", description: "MCU suffix for arduino/platformio platforms. Defaults to esp32." },
+      firmwareVersionShort: {
+        type: "string",
+        description: "Semver version to report. THiNX offers an OTT update only when the built firmware version is newer."
+      },
+      envHash: { type: "string", description: "Optional env_hash to report." },
+      autoDownload: {
+        type: "boolean",
+        description: "Download the firmware when the check-in returns FIRMWARE_UPDATE with an OTT. Defaults to config autoDownloadFirmware (true)."
+      },
+      adoptVersion: {
+        type: "boolean",
+        description: "After an automatic download, report the downloaded version on later check-ins (simulates a successful install)."
+      }
     }
   }),
   tool("thinx_connect_mqtt", "Connect to THiNX MQTT as the registered device and listen on device channels.", {
@@ -67,6 +86,39 @@ const tools = [
       retain: { type: "boolean", description: "Retain the MQTT status message. Defaults to true." }
     }
   }),
+  tool(
+    "thinx_request_ott",
+    "Request a one-time firmware token via POST /device/firmware { use: \"ott\" } using the device API key. Stores it as the pending update.",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        udid: { type: "string", description: "Device UDID. Defaults to the registered device." },
+        cloudUrl: { type: "string", description: "Override THiNX device API base URL." },
+        apiPort: { type: ["number", "string"], description: "Optional API port override." }
+      }
+    }
+  ),
+  tool(
+    "thinx_download_firmware",
+    "Download firmware via GET /device/firmware?ott=<token> and store the binary on disk (never flashed or executed). Uses the given ott, else the pending OTT from the last FIRMWARE_UPDATE check-in/MQTT push, else requests a new OTT.",
+    {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        ott: { type: "string", description: "One-time token. Defaults to the pending update token." },
+        requestNew: { type: "boolean", description: "Ignore any pending token and request a fresh OTT first." },
+        version: { type: "string", description: "Version label for the stored file. Defaults to the version offered with the OTT." },
+        adoptVersion: {
+          type: "boolean",
+          description: "Report the downloaded version on later check-ins (simulates a successful install)."
+        },
+        firmwareDir: { type: "string", description: "Directory to store the binary. Defaults to ./firmware." },
+        cloudUrl: { type: "string", description: "Override THiNX device API base URL." },
+        apiPort: { type: ["number", "string"], description: "Optional API port override." }
+      }
+    }
+  ),
   tool("thinx_disconnect_mqtt", "Disconnect the MQTT client.", {
     type: "object",
     additionalProperties: false,
@@ -154,6 +206,10 @@ export class McpJsonRpcServer {
         return textResult(this.client.recentMessages(args.limit));
       case "thinx_publish_status":
         return textResult(this.client.publishStatus(args.message, { retain: args.retain }));
+      case "thinx_request_ott":
+        return textResult(await this.client.requestOtt(args));
+      case "thinx_download_firmware":
+        return textResult(await this.client.downloadFirmware(args));
       case "thinx_disconnect_mqtt":
         return textResult(this.client.disconnectMqtt());
       case "thinx_login":
@@ -260,6 +316,14 @@ export class McpJsonRpcServer {
 
     this.client.on("checkin-error", (error) => {
       process.stderr.write(`[thinx-mcp-device] Check-in error: ${error.message}\n`);
+    });
+
+    this.client.on("firmware-error", (error) => {
+      process.stderr.write(`[thinx-mcp-device] Firmware download error: ${error.message}\n`);
+    });
+
+    this.client.on("firmware-downloaded", (download) => {
+      process.stderr.write(`[thinx-mcp-device] Firmware stored: ${download.path} (${download.size} bytes, md5 ${download.md5})\n`);
     });
   }
 }

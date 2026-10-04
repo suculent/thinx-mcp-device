@@ -5,7 +5,9 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { readInoCredentials, redactSecret } from "../src/credentials.js";
-import { selectHardwareMac, ThinxDeviceClient } from "../src/thinx-device-client.js";
+import crypto from "node:crypto";
+
+import { normalizePlatform, selectHardwareMac, ThinxDeviceClient } from "../src/thinx-device-client.js";
 
 function tempPath(name) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "thinx-mcp-device-")), name);
@@ -230,4 +232,164 @@ test("getEnvironment auto-logs-in when only credentials are configured", async (
   assert.deepEqual(result.environment, { region: "eu" });
   assert.equal(fetchImpl.calls[0].url, "https://console.thinx.cloud/api/v2/login");
   assert.equal(fetchImpl.calls[1].headers.Authorization, `Bearer ${jwt}`);
+});
+
+//
+// Platform + OTT firmware updates
+//
+
+const DEVICE_OPTS = {
+  apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ownerId: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  cloudUrl: "https://app.thinx.cloud",
+  mac: "5CCF7F123456"
+};
+const UDID = "11111111-2222-3333-4444-555555555555";
+const OTT = "c".repeat(64);
+
+// Like mockFetch, but routes may answer with a binary body and headers.
+function deviceFetch(routes) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const href = String(url);
+    calls.push({ url: href, method: init.method || "GET", headers: init.headers || {}, body: init.body });
+    const route = routes[`${init.method || "GET"} ${href}`];
+    if (!route) {
+      return { ok: false, status: 404, headers: new Headers(), text: async () => "no_route" };
+    }
+    const body = route.binary || Buffer.from(route.text || "");
+    return {
+      ok: route.ok !== false,
+      status: route.status || 200,
+      headers: new Headers(route.headers || {}),
+      text: async () => body.toString("utf8"),
+      arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.length)
+    };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+function firmwareRoute(binary) {
+  return {
+    binary,
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-length": String(binary.length),
+      "x-md5": crypto.createHash("md5").update(binary).digest("hex")
+    }
+  };
+}
+
+test("normalizes arduino/platformio platforms to <platform>:<mcu>", () => {
+  assert.equal(normalizePlatform("platformio"), "platformio:esp32");
+  assert.equal(normalizePlatform("Arduino", "esp8266"), "arduino:esp8266");
+  assert.equal(normalizePlatform("platformio:esp8266"), "platformio:esp8266");
+  assert.equal(normalizePlatform("nodejs:mcp"), "nodejs:mcp");
+});
+
+test("register persists an explicit platform for later check-ins", async () => {
+  const fetchImpl = deviceFetch({
+    "POST https://app.thinx.cloud/device/register": {
+      text: JSON.stringify({ registration: { success: true, status: "OK", owner: DEVICE_OPTS.ownerId, udid: UDID } })
+    }
+  });
+  const client = new ThinxDeviceClient({ ...DEVICE_OPTS, statePath: tempPath("state.json"), fetch: fetchImpl });
+
+  await client.register({ platform: "platformio", firmwareVersionShort: "0.0.1" });
+  await client.register();
+
+  const first = JSON.parse(fetchImpl.calls[0].body).registration;
+  const second = JSON.parse(fetchImpl.calls[1].body).registration;
+  assert.equal(first.platform, "platformio:esp32");
+  assert.equal(first.version, "0.0.1");
+  assert.equal(second.platform, "platformio:esp32");
+  assert.equal(client.safeState().platform, "platformio:esp32");
+});
+
+test("FIRMWARE_UPDATE check-in downloads the firmware via OTT and stores it", async () => {
+  const binary = crypto.randomBytes(4096);
+  const fetchImpl = deviceFetch({
+    "POST https://app.thinx.cloud/device/register": {
+      // THiNX answers an update as a stringified body without owner/success.
+      text: JSON.stringify({ registration: { status: "FIRMWARE_UPDATE", udid: UDID, ott: OTT, version: "1.2.3", auto_update: true } })
+    },
+    [`GET https://app.thinx.cloud/device/firmware?ott=${OTT}`]: firmwareRoute(binary)
+  });
+  const firmwareDir = path.dirname(tempPath("x"));
+  const client = new ThinxDeviceClient({ ...DEVICE_OPTS, statePath: tempPath("state.json"), firmwareDir, fetch: fetchImpl });
+
+  const result = await client.register({ platform: "platformio" });
+
+  assert.equal(result.registration.status, "FIRMWARE_UPDATE");
+  assert.notEqual(result.registration.ott, OTT, "OTT must be redacted in tool output");
+  assert.equal(result.firmwareDownload.md5Match, true);
+  assert.equal(result.firmwareDownload.version, "1.2.3");
+  assert.ok(result.firmwareDownload.path.startsWith(firmwareDir));
+  assert.deepEqual(fs.readFileSync(result.firmwareDownload.path), binary);
+  assert.equal(client.state.pendingUpdate, undefined);
+
+  // The same version offered again is not downloaded twice.
+  const again = await client.register();
+  assert.equal(again.firmwareDownload.skipped, true);
+  assert.equal(fetchImpl.calls.filter((call) => call.method === "GET").length, 1);
+});
+
+test("adoptVersion makes later check-ins report the downloaded version", async () => {
+  const binary = crypto.randomBytes(2048);
+  const fetchImpl = deviceFetch({
+    [`GET https://app.thinx.cloud/device/firmware?ott=${OTT}`]: firmwareRoute(binary)
+  });
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    statePath: tempPath("state.json"),
+    firmwareDir: path.dirname(tempPath("x")),
+    fetch: fetchImpl
+  });
+  client.state.udid = UDID;
+
+  await client.downloadFirmware({ ott: OTT, version: "2.0.0", adoptVersion: true });
+  assert.equal(client.registrationBody().registration.version, "2.0.0");
+});
+
+test("downloadFirmware reports a refused OTT instead of storing it", async () => {
+  const fetchImpl = deviceFetch({
+    // Util.respond sends a bare string with no octet-stream content type.
+    [`GET https://app.thinx.cloud/device/firmware?ott=${OTT}`]: { text: "OTT_UPDATE_NOT_FOUND" }
+  });
+  const firmwareDir = path.join(path.dirname(tempPath("x")), "fw");
+  const client = new ThinxDeviceClient({ ...DEVICE_OPTS, statePath: tempPath("state.json"), firmwareDir, fetch: fetchImpl });
+
+  await assert.rejects(() => client.downloadFirmware({ ott: OTT }), /OTT_UPDATE_NOT_FOUND/);
+  assert.equal(fs.existsSync(firmwareDir), false);
+});
+
+test("downloadFirmware without a pending token requests a new OTT first", async () => {
+  const binary = crypto.randomBytes(1500);
+  const fetchImpl = deviceFetch({
+    "POST https://app.thinx.cloud/device/firmware": { text: JSON.stringify({ ott: OTT }) },
+    [`GET https://app.thinx.cloud/device/firmware?ott=${OTT}`]: firmwareRoute(binary)
+  });
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    statePath: tempPath("state.json"),
+    firmwareDir: path.dirname(tempPath("x")),
+    fetch: fetchImpl
+  });
+  client.state.udid = UDID;
+
+  const download = await client.downloadFirmware();
+
+  const request = fetchImpl.calls[0];
+  assert.equal(request.headers.Authentication, DEVICE_OPTS.apiKey);
+  assert.deepEqual(JSON.parse(request.body), { use: "ott", owner: DEVICE_OPTS.ownerId, udid: UDID, mac: "5CCF7F123456" });
+  assert.equal(download.source, "request");
+  assert.equal(download.size, binary.length);
+});
+
+test("requestOtt surfaces a refusal", async () => {
+  const fetchImpl = deviceFetch({ "POST https://app.thinx.cloud/device/firmware": { text: "OTT_API_KEY_NOT_VALID" } });
+  const client = new ThinxDeviceClient({ ...DEVICE_OPTS, statePath: tempPath("state.json"), fetch: fetchImpl });
+  client.state.udid = UDID;
+  await assert.rejects(() => client.requestOtt(), /OTT_API_KEY_NOT_VALID/);
 });

@@ -10,11 +10,16 @@ import { DEFAULT_INO_PATH, readInoCredentials, redactSecret } from "./credential
 
 const DEFAULT_CONFIG_PATH = fileURLToPath(new URL("../thinx-device.config.json", import.meta.url));
 const DEFAULT_STATE_PATH = fileURLToPath(new URL("../.thinx-device-state.json", import.meta.url));
+const DEFAULT_FIRMWARE_DIR = fileURLToPath(new URL("../firmware", import.meta.url));
 const DEFAULT_NETWORK_INTERFACES = ["en0", "eth0", "wlan0"];
 const DEFAULT_CHECKIN_INTERVAL_SECONDS = 300;
 const DEFAULT_FIRMWARE_VERSION = "thinx-mcp-device:0.1.0";
 const DEFAULT_FIRMWARE_VERSION_SHORT = "0.1.0";
 const DEFAULT_APP_VERSION = "thinx-mcp-device:0.1.0";
+const DEFAULT_MCU = "esp32";
+// Platforms THiNX builds a single firmware.bin for and serves via OTT
+// (device.js updateFromPath). Firmware reports them as "<platform>:<mcu>".
+export const FIRMWARE_PLATFORMS = ["arduino", "platformio"];
 
 function parseBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") {
@@ -39,6 +44,19 @@ function normalizeBaseUrl(value) {
     return raw.replace(/\/+$/, "");
   }
   return `https://${raw}`;
+}
+
+// "platformio" -> "platformio:esp32", the shape THiNXLib reports. Anything
+// that already carries an MCU suffix (or is not a firmware platform) is kept.
+export function normalizePlatform(platform, mcu = DEFAULT_MCU) {
+  const value = String(platform || "").trim().toLowerCase();
+  if (!value) {
+    return undefined;
+  }
+  if (!value.includes(":") && FIRMWARE_PLATFORMS.includes(value)) {
+    return `${value}:${String(mcu || DEFAULT_MCU).toLowerCase()}`;
+  }
+  return value;
 }
 
 function readJsonFile(filePath, fallback) {
@@ -111,6 +129,26 @@ function unwrapRegistration(payload) {
   }
   const inner = typeof payload?.response === "string" ? tryJson(payload.response) : payload?.response;
   return inner?.registration;
+}
+
+// THiNXLib accepts an update token from a check-in response
+// ({ registration: { status: "FIRMWARE_UPDATE", ott } }) or an MQTT push of
+// the same shape; `update.ott` and a bare `ott` are accepted as well.
+export function extractFirmwareUpdate(payload) {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+  for (const node of [payload.registration, payload.update, payload]) {
+    if (node && typeof node === "object" && typeof node.ott === "string" && node.ott.length > 5) {
+      return {
+        ott: node.ott,
+        version: node.version,
+        status: node.status,
+        mac: node.mac
+      };
+    }
+  }
+  return undefined;
 }
 
 function decodeJwtExpiry(token) {
@@ -204,7 +242,19 @@ export class ThinxDeviceClient extends EventEmitter {
         fileConfig.firmwareVersionShort ||
         DEFAULT_FIRMWARE_VERSION_SHORT,
       commitId: options.commitId || process.env.THINX_COMMIT_ID || fileConfig.commitId || "0",
+      mcu: options.mcu || process.env.THINX_MCU || fileConfig.mcu || DEFAULT_MCU,
       platform: options.platform || process.env.THINX_PLATFORM || fileConfig.platform || "nodejs:mcp",
+      envHash: options.envHash || process.env.THINX_ENV_HASH || fileConfig.envHash,
+      // OTT firmware downloads are stored here and never executed.
+      firmwareDir: options.firmwareDir || process.env.THINX_FIRMWARE_DIR || fileConfig.firmwareDir || DEFAULT_FIRMWARE_DIR,
+      autoDownloadFirmware: parseBoolean(
+        options.autoDownloadFirmware ?? process.env.THINX_AUTO_DOWNLOAD_FIRMWARE ?? fileConfig.autoDownloadFirmware,
+        true
+      ),
+      adoptDownloadedVersion: parseBoolean(
+        options.adoptDownloadedVersion ?? process.env.THINX_ADOPT_DOWNLOADED_VERSION ?? fileConfig.adoptDownloadedVersion,
+        false
+      ),
       autoUpdate: parseBoolean(options.autoUpdate ?? process.env.THINX_AUTO_UPDATE ?? fileConfig.autoUpdate, false),
       forcedUpdate: parseBoolean(options.forcedUpdate ?? process.env.THINX_FORCED_UPDATE ?? fileConfig.forcedUpdate, false),
       insecureTls: parseBoolean(options.insecureTls ?? process.env.THINX_INSECURE_TLS ?? fileConfig.insecureTls, false),
@@ -273,6 +323,16 @@ export class ThinxDeviceClient extends EventEmitter {
     return this.deviceChannel ? `${this.deviceChannel}/status` : undefined;
   }
 
+  // Platform reported at check-in: an explicit thinx_register argument is
+  // persisted so periodic check-ins keep reporting it.
+  get platform() {
+    return normalizePlatform(this.state.platform || this.config.platform, this.state.mcu || this.config.mcu);
+  }
+
+  get reportedVersion() {
+    return this.state.adoptedVersion || this.config.firmwareVersionShort;
+  }
+
   saveState() {
     const directory = path.dirname(this.statePath);
     fs.mkdirSync(directory, { recursive: true });
@@ -287,14 +347,18 @@ export class ThinxDeviceClient extends EventEmitter {
     const registration = {
       mac: overrides.mac || this.mac,
       firmware: overrides.firmwareVersion || this.config.firmwareVersion,
-      version: overrides.firmwareVersionShort || this.config.firmwareVersionShort,
+      version: overrides.firmwareVersionShort || this.reportedVersion,
       commit: overrides.commitId || this.config.commitId,
       owner: overrides.ownerId || this.config.ownerId,
       alias: overrides.alias || this.state.alias || this.config.alias,
       status: overrides.status || "Registered",
-      platform: overrides.platform || this.config.platform,
+      platform: overrides.platform ? normalizePlatform(overrides.platform, overrides.mcu || this.config.mcu) : this.platform,
       fcid: overrides.fcid || this.mac
     };
+
+    if (overrides.envHash || this.config.envHash) {
+      registration.env_hash = overrides.envHash || this.config.envHash;
+    }
 
     const udid = overrides.udid || this.state.udid;
     if (udid && udid !== "0") {
@@ -309,15 +373,36 @@ export class ThinxDeviceClient extends EventEmitter {
     return { registration };
   }
 
-  registerUrl(overrides = {}) {
-    this.reloadConfig(overrides);
+  // Device API URL (registration, firmware) on cloudUrl with optional port.
+  deviceApiUrl(pathname, overrides = {}) {
     const base = normalizeBaseUrl(overrides.cloudUrl || this.config.cloudUrl);
     const url = new URL(base);
     if (overrides.apiPort || process.env.THINX_API_PORT) {
       url.port = String(overrides.apiPort || process.env.THINX_API_PORT);
     }
-    url.pathname = normalizeRegisterPath(overrides.registerPath || this.config.registerPath);
+    url.pathname = pathname;
     return url;
+  }
+
+  registerUrl(overrides = {}) {
+    this.reloadConfig(overrides);
+    return this.deviceApiUrl(normalizeRegisterPath(overrides.registerPath || this.config.registerPath), overrides);
+  }
+
+  applyTlsPolicy() {
+    if (this.config.insecureTls) {
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    }
+  }
+
+  deviceHeaders() {
+    return {
+      Authentication: this.config.apiKey,
+      Accept: "application/json",
+      Origin: "device",
+      "Content-Type": "application/json",
+      "User-Agent": "THiNX-Client"
+    };
   }
 
   async register(overrides = {}) {
@@ -325,19 +410,16 @@ export class ThinxDeviceClient extends EventEmitter {
     const url = this.registerUrl(overrides);
     const body = this.registrationBody(overrides);
 
-    if (this.config.insecureTls) {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    if (overrides.platform) {
+      this.state.platform = body.registration.platform;
+      this.saveState();
     }
 
-    const response = await fetch(url, {
+    this.applyTlsPolicy();
+
+    const response = await this.fetchImpl(url, {
       method: "POST",
-      headers: {
-        Authentication: this.config.apiKey,
-        Accept: "application/json",
-        Origin: "device",
-        "Content-Type": "application/json",
-        "User-Agent": "THiNX-Client"
-      },
+      headers: this.deviceHeaders(),
       body: JSON.stringify(body)
     });
 
@@ -355,9 +437,11 @@ export class ThinxDeviceClient extends EventEmitter {
 
     const registration = this.applyRegistrationResponse(payload);
     this.emit("registered", registration);
+    const firmwareDownload = await this.handleFirmwareUpdate(registration, "registration", overrides);
     return {
       url: url.toString(),
-      registration,
+      registration: { ...registration, ...(registration.ott ? { ott: redactSecret(registration.ott) } : {}) },
+      ...(firmwareDownload ? { firmwareDownload } : {}),
       state: this.safeState()
     };
   }
@@ -401,6 +485,11 @@ export class ThinxDeviceClient extends EventEmitter {
 
     if (registration.timestamp) {
       this.state.lastCheckinTimestamp = registration.timestamp;
+    }
+
+    const update = extractFirmwareUpdate({ registration });
+    if (update) {
+      this.recordPendingUpdate(update, "registration");
     }
 
     this.state.lastRegistrationStatus = registration.status || (registration.success ? "OK" : undefined);
@@ -511,6 +600,12 @@ export class ThinxDeviceClient extends EventEmitter {
         this.messages.push(message);
         this.messages = this.messages.slice(-100);
         this.emit("message", message);
+
+        const update = extractFirmwareUpdate(message.json);
+        if (update) {
+          this.recordPendingUpdate(update, "mqtt");
+          this.handleFirmwareUpdate(update, "mqtt").catch((error) => this.emit("firmware-error", error));
+        }
       });
 
       client.on("error", (error) => {
@@ -585,6 +680,150 @@ export class ThinxDeviceClient extends EventEmitter {
 
   recentMessages(limit = 20) {
     return this.messages.slice(-Number(limit || 20));
+  }
+
+  //
+  // OTT firmware updates
+  //
+  // Mirrors THiNXLib: a check-in answering status FIRMWARE_UPDATE (or an MQTT
+  // push) carries a one-time token; the device fetches the binary from
+  // GET /device/firmware?ott=<token>. A token can also be requested directly
+  // with POST /device/firmware { use: "ott", owner, udid }. The downloaded
+  // binary is only stored on disk — nothing is flashed or executed.
+  //
+
+  recordPendingUpdate(update, source) {
+    this.state.pendingUpdate = {
+      ott: update.ott,
+      version: update.version,
+      status: update.status,
+      source,
+      receivedAt: new Date().toISOString()
+    };
+    this.saveState();
+    this.emit("firmware-update", { ...this.state.pendingUpdate, ott: redactSecret(update.ott) });
+    return this.state.pendingUpdate;
+  }
+
+  // Auto-downloads an offered update unless disabled or that version was
+  // already downloaded (THiNX re-offers it on every check-in until the device
+  // reports the new version). Never throws: errors are returned/emitted.
+  async handleFirmwareUpdate(registration, source, overrides = {}) {
+    const update = extractFirmwareUpdate({ registration });
+    const enabled = overrides.autoDownload ?? this.config.autoDownloadFirmware;
+    if (!update || !enabled) {
+      return undefined;
+    }
+    const last = this.state.lastFirmwareDownload;
+    if (update.version && last?.version === update.version && last.path && fs.existsSync(last.path)) {
+      return { skipped: true, reason: `version ${update.version} already downloaded`, path: last.path };
+    }
+    try {
+      return await this.downloadFirmware({
+        ott: update.ott,
+        version: update.version,
+        source,
+        adoptVersion: overrides.adoptVersion ?? this.config.adoptDownloadedVersion
+      });
+    } catch (error) {
+      this.emit("firmware-error", error);
+      return { error: error.message };
+    }
+  }
+
+  async requestOtt(overrides = {}) {
+    this.reloadConfig(overrides);
+    this.validateCredentials();
+    const udid = this.resolveUdid(overrides);
+    const url = this.deviceApiUrl("/device/firmware", overrides);
+    this.applyTlsPolicy();
+
+    const response = await this.fetchImpl(url, {
+      method: "POST",
+      headers: this.deviceHeaders(),
+      body: JSON.stringify({ use: "ott", owner: this.ownerId, udid, mac: this.mac })
+    });
+    const text = await response.text();
+    const payload = tryJson(text);
+    const ott = payload?.ott || payload?.response?.ott;
+
+    if (!response.ok || typeof ott !== "string") {
+      throw new Error(`OTT request failed with HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+
+    const pending = this.recordPendingUpdate({ ott }, "request");
+    return { udid, url: url.toString(), ott, pendingUpdate: { ...pending, ott: redactSecret(ott) } };
+  }
+
+  async downloadFirmware(overrides = {}) {
+    this.reloadConfig(overrides);
+    let ott = overrides.ott;
+    let version = overrides.version;
+    let source = overrides.source || "argument";
+    if (!ott && !overrides.requestNew && this.state.pendingUpdate?.ott) {
+      ott = this.state.pendingUpdate.ott;
+      version = version || this.state.pendingUpdate.version;
+      source = `pending:${this.state.pendingUpdate.source}`;
+    }
+    if (!ott) {
+      ({ ott } = await this.requestOtt(overrides));
+      source = "request";
+    }
+
+    const url = this.deviceApiUrl("/device/firmware", overrides);
+    url.searchParams.set("ott", ott);
+    this.applyTlsPolicy();
+
+    const response = await this.fetchImpl(url, {
+      method: "GET",
+      headers: { Accept: "application/octet-stream", "User-Agent": "THiNX-Client" }
+    });
+
+    const contentType = response.headers?.get?.("content-type") || "";
+    // Refusals come back as a bare string or JSON envelope, not octet-stream.
+    if (!response.ok || !contentType.includes("application/octet-stream")) {
+      const text = await response.text();
+      throw new Error(`Firmware download failed with HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const md5 = crypto.createHash("md5").update(buffer).digest("hex");
+    const expectedMd5 = response.headers.get("x-md5") || undefined;
+    const declaredLength = response.headers.get("content-length");
+    const outputDir = overrides.firmwareDir || this.config.firmwareDir;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeVersion = String(version || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
+    const filePath = path.join(outputDir, `${this.udid || "device"}-${safeVersion}-${stamp}.bin`);
+
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(filePath, buffer);
+
+    const download = {
+      path: filePath,
+      size: buffer.length,
+      md5,
+      expectedMd5,
+      md5Match: expectedMd5 ? expectedMd5.toLowerCase() === md5 : null,
+      declaredLength: declaredLength ? Number(declaredLength) : null,
+      version,
+      source,
+      url: `${url.origin}${url.pathname}?ott=${redactSecret(ott)}`,
+      downloadedAt: new Date().toISOString()
+    };
+
+    this.state.lastFirmwareDownload = download;
+    this.state.firmwareDownloads = [...(this.state.firmwareDownloads || []), download].slice(-10);
+    if (this.state.pendingUpdate?.ott === ott) {
+      delete this.state.pendingUpdate;
+    }
+    // Pretend the update was installed: later check-ins report this version.
+    if (overrides.adoptVersion && version) {
+      this.state.adoptedVersion = version;
+      download.adoptedVersion = version;
+    }
+    this.saveState();
+    this.emit("firmware-downloaded", download);
+    return download;
   }
 
   //
@@ -763,6 +1002,14 @@ export class ThinxDeviceClient extends EventEmitter {
       mac: this.state.mac,
       lastRegistrationStatus: this.state.lastRegistrationStatus,
       lastRegisteredAt: this.state.lastRegisteredAt,
+      platform: this.platform,
+      reportedVersion: this.reportedVersion,
+      firmwareDir: this.config.firmwareDir,
+      autoDownloadFirmware: this.config.autoDownloadFirmware,
+      pendingUpdate: this.state.pendingUpdate
+        ? { ...this.state.pendingUpdate, ott: redactSecret(this.state.pendingUpdate.ott) }
+        : null,
+      lastFirmwareDownload: this.state.lastFirmwareDownload || null,
       mqttConnected: this.mqttConnected,
       deviceChannel: this.deviceChannel,
       statusChannel: this.statusChannel,
