@@ -725,12 +725,20 @@ export class ThinxDeviceClient extends EventEmitter {
             fail(error);
             return;
           }
+          // On an automatic reconnect our repeat subscribe is short-circuited by
+          // mqtt.js (the topics are already tracked for its own auto-resubscribe),
+          // so it calls back with an empty granted array. Keep the grants captured
+          // on the first connect instead of overwriting them with "refused".
           // SUBACK 128 (0x80) or >= 0x80 under MQTT 5 means the ACL refused it.
-          this.mqttSubscriptions = topics.map((topic) => {
-            const grant = granted.find((entry) => entry.topic === topic);
-            const qos = grant ? grant.qos : undefined;
-            return { topic, qos, granted: qos !== undefined && qos < 128 };
-          });
+          if (granted.length > 0) {
+            this.mqttSubscriptions = topics.map((topic, index) => {
+              // SUBACK return codes are in request order; fall back to it when the
+              // broker echoes topics in a form that is not string-identical.
+              const grant = granted.find((entry) => entry.topic === topic) ?? granted[index];
+              const qos = grant ? grant.qos : undefined;
+              return { topic, qos, granted: qos !== undefined && qos < 128 };
+            });
+          }
           if (!this.mqttSubscriptions.find((entry) => entry.topic === this.deviceChannel)?.granted) {
             fail(new Error(`Broker refused subscription to ${this.deviceChannel}.`));
             return;

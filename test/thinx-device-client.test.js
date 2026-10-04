@@ -593,3 +593,44 @@ test("MQTT messages on the device channel are buffered and OTTs picked up", asyn
   assert.equal(client.state.pendingUpdate.ott, OTT);
   assert.equal(client.state.pendingUpdate.source, "mqtt");
 });
+
+test("a reconnect whose re-subscribe returns no new grants keeps the subscription state", async () => {
+  // Reproduces mqtt.js 5.x: a repeat subscribe for topics it already tracks
+  // short-circuits and calls back with an empty granted array (its own
+  // auto-resubscribe keeps the topics live). Our connect handler must not
+  // overwrite the first connect's grants with "refused".
+  const connect = (url, options) => {
+    const client = new EventEmitter();
+    client.options = options;
+    client.published = [];
+    let subCount = 0;
+    client.subscribe = (topics, _opts, callback) => {
+      subCount += 1;
+      const granted = subCount === 1 ? topics.map((topic) => ({ topic, qos: 0 })) : [];
+      callback(null, granted);
+    };
+    client.publish = (topic, payload, opts) => client.published.push({ topic, payload, opts });
+    client.end = () => {};
+    connect.clients.push(client);
+    setImmediate(() => client.emit("connect"));
+    return client;
+  };
+  connect.clients = [];
+
+  const client = new ThinxDeviceClient({
+    ...DEVICE_OPTS,
+    checkinIntervalSeconds: 0,
+    statePath: tempPath("state.json"),
+    fetch: registerOk(),
+    mqttConnect: connect
+  });
+  await client.connectMqtt();
+  assert.ok(client.safeState().mqttSubscriptions.every((s) => s.granted));
+
+  // Automatic reconnect: mqtt.js fires "connect" again.
+  connect.clients[0].emit("connect");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const subs = client.safeState().mqttSubscriptions;
+  assert.ok(subs.every((s) => s.granted), "subscriptions should stay granted after a reconnect");
+});
