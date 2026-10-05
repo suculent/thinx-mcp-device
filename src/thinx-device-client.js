@@ -739,9 +739,9 @@ export class ThinxDeviceClient extends EventEmitter {
               const qos = grant ? grant.qos : undefined;
               return { topic, qos, granted: qos !== undefined && qos < 128 };
             });
-            this.grantedTopics = this.mqttSubscriptions;
+            this.grantedTopics = [...this.mqttSubscriptions];
           } else {
-            this.mqttSubscriptions = this.grantedTopics;
+            this.mqttSubscriptions = [...this.grantedTopics];
           }
           if (!this.mqttSubscriptions.find((entry) => entry.topic === this.deviceChannel)?.granted) {
             fail(new Error(`Broker refused subscription to ${this.deviceChannel}.`));
