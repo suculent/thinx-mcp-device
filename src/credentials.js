@@ -1,7 +1,15 @@
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const DEFAULT_INO_PATH =
-  "/Users/igraczech/Repositories/thinx-firmware-esp32/examples/thinx-esp32-example/thinx-esp32-example.ino";
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Falls back to the Arduino example bundled in this repo. Override with the
+// THINX_EXAMPLE_INO environment variable (see thinx-device-client.js).
+export const DEFAULT_INO_PATH = path.resolve(
+  __dirname,
+  "../docs/thinx-firmware-esp32/examples/thinx-esp32-example/thinx-esp32-example.ino"
+);
 
 const CONSTANT_NAMES = {
   apiKey: ["apikey", "api_key", "THINX_API_KEY"],

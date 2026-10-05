@@ -16,11 +16,13 @@ Default settings live in:
 ./thinx-device.config.json
 ```
 
-The fallback Arduino example path is:
+The fallback Arduino example path defaults to the copy bundled in this repo:
 
 ```text
-/Users/igraczech/Repositories/thinx-firmware-esp32/examples/thinx-esp32-example/thinx-esp32-example.ino
+./docs/thinx-firmware-esp32/examples/thinx-esp32-example/thinx-esp32-example.ino
 ```
+
+Override it with the `THINX_EXAMPLE_INO` environment variable.
 
 ## Run
 
@@ -36,7 +38,7 @@ For an MCP client, use:
   "mcpServers": {
     "thinx-device": {
       "command": "node",
-      "args": ["/Users/igraczech/thinx-mcp-device/src/index.js"]
+      "args": ["/path/to/thinx-mcp-device/src/index.js"]
     }
   }
 }
