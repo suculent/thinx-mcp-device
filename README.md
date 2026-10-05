@@ -1,5 +1,7 @@
 # THiNX MCP Device
 
+> **SECURITY WARNING:** This is a development/test tool that opens a path to remotely execute code on the machine it runs at. Do not use it, if you don't understand it. Do not use it in production or controlled environments.
+
 Simple MCP stdio server that acts like a THiNX device client:
 
 - includes the public test `apikey` and `owner_id` from the ESP32 example `.ino` file
