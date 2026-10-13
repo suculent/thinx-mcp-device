@@ -787,3 +787,30 @@ test("an approval with a pending update triggers the firmware download; denial a
   assert.equal(denialState.responseCount, 3, "string denial is recorded");
   assert.equal(denialState.lastResponse.approved, false, "denial recorded as not approved");
 });
+
+test("an approval overrides auto-update-off: it downloads the pending update even when autoDownloadFirmware is false", async () => {
+  const statePath = tempPath("state.json");
+  const mqttConnect = fakeMqtt();
+  const calls = [];
+  const client = new ThinxDeviceClient({
+    statePath,
+    apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ownerId: OWNER,
+    autoDownloadFirmware: false,
+    mqttConnect
+  });
+  client.state.ownerId = OWNER;
+  client.state.udid = UDID;
+  client.handleFirmwareUpdate = async (update, source, overrides) => { calls.push({ update, source, overrides }); return { stubbed: true }; };
+  await client.connectMqtt({ autoRegister: false });
+  const [mqttClient] = mqttConnect.clients;
+  const channel = `/${OWNER}/${UDID}`;
+  client.state.pendingUpdate = { ott: "ott-token-123456", version: "1.2.3", status: "FIRMWARE_UPDATE" };
+
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: true } })), { retain: false });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(calls.length, 1, "approval downloads even with autoDownloadFirmware false");
+  assert.equal(calls[0].source, "notification");
+  assert.equal(calls[0].overrides.autoDownload, true, "forces the download past the auto-download flag");
+});

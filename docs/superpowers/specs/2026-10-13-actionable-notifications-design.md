@@ -131,10 +131,13 @@ guards (`topic === this.deviceChannel`, `message.json` present,
        `state.outstandingNotification.done = true` if present, `saveState()`;
     2. emit `"notification-response"`;
     3. OTA mirror: if `isApproval(...) === true` **and**
-       `state.pendingUpdate?.ott` **and** auto-download enabled, call the
-       existing `handleFirmwareUpdate` / `downloadFirmware` non-blocking
-       (`.catch` → `emit("firmware-error")`). Denial or unrecognized → record
-       only.
+       `state.pendingUpdate?.ott`, call the existing `handleFirmwareUpdate` /
+       `downloadFirmware` non-blocking with `{ autoDownload: true }`
+       (`.catch` → `emit("firmware-error")`). The approval is the user's
+       explicit consent, so it **overrides auto-update-off**: when new firmware
+       is available the update is deferred to the user, who confirms a safe
+       window, and that confirmation must download regardless of the
+       `autoDownloadFirmware` flag. Denial or unrecognized → record only.
   - `undefined` → leave for existing handlers.
 
 ### Observability

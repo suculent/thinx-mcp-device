@@ -997,11 +997,14 @@ export class ThinxDeviceClient extends EventEmitter {
     this.emit("notification-response", entry);
 
     // OTA mirror (faithful to THiNXLib32 NOTIFICATION case): an approval of a
-    // pending firmware update triggers the existing download. Nothing else runs.
-    const autoDownload = this.config.autoDownloadFirmware;
-    if (approved === true && autoDownload && this.state.pendingUpdate?.ott) {
+    // pending firmware update triggers the existing download. The approval is
+    // the user's explicit consent, so it overrides auto-update-off — the whole
+    // point of deferring the update to the user is that they pick a safe
+    // window. Pass autoDownload:true so handleFirmwareUpdate does not re-gate on
+    // the config flag. Nothing else runs.
+    if (approved === true && this.state.pendingUpdate?.ott) {
       const { ott, version, status } = this.state.pendingUpdate;
-      this.handleFirmwareUpdate({ ott, version, status }, "notification").catch((error) =>
+      this.handleFirmwareUpdate({ ott, version, status }, "notification", { autoDownload: true }).catch((error) =>
         this.emit("firmware-error", error)
       );
     }
