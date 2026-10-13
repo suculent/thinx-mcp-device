@@ -669,3 +669,41 @@ test("an explicit disconnect clears the reported subscriptions", async () => {
   client.disconnectMqtt();
   assert.deepEqual(client.safeState().mqttSubscriptions, []);
 });
+
+test("publishNotification emits an actionable payload to the device channel and records it", async () => {
+  const statePath = tempPath("state.json");
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    statePath,
+    apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ownerId: OWNER,
+    mqttConnect
+  });
+  client.state.ownerId = OWNER;
+  client.state.udid = UDID;
+  await client.connectMqtt({ autoRegister: false });
+  const [mqttClient] = mqttConnect.clients;
+  mqttClient.published.length = 0; // drop the retained "connected" status
+
+  const result = client.publishNotification({ title: "Hi", body: "Update now?", responseType: "bool" });
+
+  assert.equal(result.topic, `/${OWNER}/${UDID}`);
+  const sent = mqttClient.published.find((p) => p.topic === `/${OWNER}/${UDID}`);
+  assert.ok(sent, "published to device channel");
+  assert.deepEqual(JSON.parse(sent.payload), {
+    notification: { body: "Update now?", response_type: "bool", title: "Hi" }
+  });
+  assert.equal(sent.opts.retain, false);
+  assert.equal(client.safeState().notifications.outstanding.body, "Update now?");
+});
+
+test("publishNotification throws when MQTT is not connected", () => {
+  const client = new ThinxDeviceClient({
+    statePath: tempPath("state.json"),
+    apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ownerId: OWNER
+  });
+  client.state.ownerId = OWNER;
+  client.state.udid = UDID;
+  assert.throws(() => client.publishNotification({ body: "x" }), /MQTT is not connected/);
+});

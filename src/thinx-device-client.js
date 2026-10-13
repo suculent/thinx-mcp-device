@@ -9,6 +9,7 @@ import mqtt from "mqtt";
 import { DEFAULT_INO_PATH, readInoCredentials, redactSecret } from "./credentials.js";
 import { evaluateCommand, DEFAULT_ALLOW } from "./command-policy.js";
 import { createCommandRunner } from "./command-runner.js";
+import { classifyNotification, isApproval, buildNotificationPayload } from "./notifications.js";
 
 const DEFAULT_CONFIG_PATH = fileURLToPath(new URL("../thinx-device.config.json", import.meta.url));
 const DEFAULT_STATE_PATH = fileURLToPath(new URL("../.thinx-device-state.json", import.meta.url));
@@ -938,6 +939,35 @@ export class ThinxDeviceClient extends EventEmitter {
     };
   }
 
+  //
+  // Actionable notifications
+  //
+  // publishNotification emits { notification: { title?, body, response_type } }
+  // (no `response` field) on the device channel, as a real THiNX device does;
+  // the response comes back on the same channel and is handled in the MQTT
+  // message handler via classifyNotification.
+  //
+
+  publishNotification({ title, body, responseType = "bool", retain = false } = {}) {
+    if (!this.mqttClient || !this.mqttConnected) {
+      throw new Error("MQTT is not connected.");
+    }
+    const topic = this.deviceChannel;
+    const payload = JSON.stringify(buildNotificationPayload({ title, body, responseType }));
+    this.mqttClient.publish(topic, payload, { qos: 0, retain: Boolean(retain) });
+    this.state.outstandingNotification = {
+      title: typeof title === "string" && title.length > 0 ? title : undefined,
+      body,
+      responseType,
+      topic,
+      publishedAt: new Date().toISOString(),
+      done: false
+    };
+    this.saveState();
+    this.emit("notification-published", { topic, outstanding: this.state.outstandingNotification });
+    return { topic, payload, outstanding: this.state.outstandingNotification };
+  }
+
   disconnectMqtt() {
     if (this.checkinTimer) {
       clearInterval(this.checkinTimer);
@@ -1330,6 +1360,11 @@ export class ThinxDeviceClient extends EventEmitter {
         ? { ...this.state.pendingUpdate, ott: redactSecret(this.state.pendingUpdate.ott) }
         : null,
       lastFirmwareDownload: this.state.lastFirmwareDownload || null,
+      notifications: {
+        outstanding: this.state.outstandingNotification || null,
+        lastResponse: this.state.lastNotificationResponse || null,
+        responseCount: (this.state.notificationResponses || []).length
+      },
       mqttConnected: this.mqttConnected,
       autoConnectMqtt: this.config.autoConnectMqtt,
       mqttSubscriptions: this.mqttSubscriptions,
