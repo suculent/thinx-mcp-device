@@ -790,6 +790,16 @@ export class ThinxDeviceClient extends EventEmitter {
             .then((reply) => this.publishConsole(reply))
             .catch((error) => this.emit("command-error", error));
         }
+
+        // Actionable-notification response on the device channel. Retained
+        // messages are skipped so a stored reply does not replay on reconnect;
+        // our own emitted notification loops back as an "echo" and is ignored.
+        if (topic === this.deviceChannel && !packet?.retain && message.json) {
+          const classified = classifyNotification(message.json);
+          if (classified && classified.kind === "response") {
+            this.recordNotificationResponse(classified);
+          }
+        }
       });
 
       client.on("error", (error) => {
@@ -966,6 +976,26 @@ export class ThinxDeviceClient extends EventEmitter {
     this.saveState();
     this.emit("notification-published", { topic, outstanding: this.state.outstandingNotification });
     return { topic, payload, outstanding: this.state.outstandingNotification };
+  }
+
+  recordNotificationResponse(classified) {
+    const approved = isApproval(classified.responseType, classified.response);
+    const entry = {
+      responseType: classified.responseType,
+      response: classified.response,
+      approved,
+      nid: classified.nid,
+      via: classified.via,
+      receivedAt: new Date().toISOString()
+    };
+    this.state.notificationResponses = [...(this.state.notificationResponses || []), entry].slice(-10);
+    this.state.lastNotificationResponse = entry;
+    if (this.state.outstandingNotification) {
+      this.state.outstandingNotification.done = true;
+    }
+    this.saveState();
+    this.emit("notification-response", entry);
+    return entry;
   }
 
   disconnectMqtt() {

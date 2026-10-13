@@ -707,3 +707,37 @@ test("publishNotification throws when MQTT is not connected", () => {
   client.state.udid = UDID;
   assert.throws(() => client.publishNotification({ body: "x" }), /MQTT is not connected/);
 });
+
+test("records a notification response received on the device channel, ignores echo and retained", async () => {
+  const statePath = tempPath("state.json");
+  const mqttConnect = fakeMqtt();
+  const client = new ThinxDeviceClient({
+    statePath,
+    apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ownerId: OWNER,
+    mqttConnect
+  });
+  client.state.ownerId = OWNER;
+  client.state.udid = UDID;
+  await client.connectMqtt({ autoRegister: false });
+  const [mqttClient] = mqttConnect.clients;
+  const channel = `/${OWNER}/${UDID}`;
+
+  const events = [];
+  client.on("notification-response", (e) => events.push(e));
+
+  // echo of our own emit: no truthy response → ignored
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { body: "Update?", response_type: "bool" } })), { retain: false });
+  // retained response → ignored
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: true } })), { retain: true });
+  assert.equal(events.length, 0, "echo and retained produce no response");
+
+  // real response
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { nid: "nid-1", response_type: "string", response: "yes" } })), { retain: false });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].approved, true);
+  assert.equal(events[0].via, "notification");
+  const state = client.safeState();
+  assert.equal(state.notifications.lastResponse.response, "yes");
+  assert.equal(state.notifications.responseCount, 1);
+});
