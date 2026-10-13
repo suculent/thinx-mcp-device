@@ -53,6 +53,7 @@ For an MCP client, use:
 - `thinx_status`: shows redacted API key, UDID, topics, and connection state.
 - `thinx_recent_messages`: returns received MQTT messages buffered by the server.
 - `thinx_publish_status`: publishes to `/<owner>/<udid>/status`.
+- `thinx_publish_notification`: publishes an actionable notification to `/<owner>/<udid>` (see [Actionable notifications](#actionable-notifications)).
 - `thinx_request_ott`: requests a one-time firmware token (`POST /device/firmware {use:"ott"}`).
 - `thinx_download_firmware`: downloads firmware via `GET /device/firmware?ott=…` and stores it.
 - `thinx_disconnect_mqtt`: closes MQTT.
@@ -90,6 +91,41 @@ device connects to the broker and listens, as THiNXLib does after registration:
   download described below.
 - `thinx_disconnect_mqtt` publishes a retained `disconnected` status and closes the
   connection. The next check-in connects again, unless it passes `connectMqtt: false`.
+
+## Actionable notifications
+
+A real THiNX device can raise an *actionable notification* — a prompt the
+THiNX cloud/console shows with action buttons (Yes/No). The emulator mirrors
+both device-side halves.
+
+### Emit — `thinx_publish_notification`
+
+Publishes to the device channel `/<owner>/<udid>`:
+
+    { "notification": { "title": "<optional>", "body": "<text>", "response_type": "bool" } }
+
+- `response_type` is `bool` (true/false) or `string` ("yes"/"no").
+- No `response` field is sent, so the API classifies it as *from device* and
+  shows it to the owner's console/app over its WebSocket channel.
+- `retain` defaults to false; a retained actionable would re-fire on reconnect.
+
+Requires an active MQTT connection (run `thinx_register` / `thinx_connect_mqtt`
+first).
+
+### Response
+
+When the user responds, the cloud publishes the reply back on the same
+channel. The emulator recognizes two shapes:
+
+    { "notification": { "nid": "<id>", "response_type": "bool", "response": true } }   # primary
+    { "nid": "nid:<udid>", "reply": <value> }                                          # HTTP-route shape
+
+Responses are recorded and surfaced under `notifications` in `thinx_status`
+(and as raw messages in `thinx_recent_messages`). Faithful to the device
+firmware, an approval (`bool` true / `string` "yes") of a **pending firmware
+update** triggers the emulator's firmware download; nothing else runs.
+The emulator ignores its own emitted notification looping back, and ignores
+retained responses on reconnect.
 
 Turn the automatic connect off with `autoConnectMqtt: false` in the config,
 `THINX_AUTO_CONNECT_MQTT=false`, or `connectMqtt: false` on a single
