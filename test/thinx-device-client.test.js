@@ -741,3 +741,40 @@ test("records a notification response received on the device channel, ignores ec
   assert.equal(state.notifications.lastResponse.response, "yes");
   assert.equal(state.notifications.responseCount, 1);
 });
+
+test("an approval with a pending update triggers the firmware download; denial and no-pending do not", async () => {
+  const statePath = tempPath("state.json");
+  const mqttConnect = fakeMqtt();
+  const downloads = [];
+  const client = new ThinxDeviceClient({
+    statePath,
+    apiKey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ownerId: OWNER,
+    mqttConnect
+  });
+  client.state.ownerId = OWNER;
+  client.state.udid = UDID;
+  // Stub the download path so the test does not hit the network.
+  client.handleFirmwareUpdate = async (update, source) => { downloads.push({ update, source }); return { stubbed: true }; };
+  await client.connectMqtt({ autoRegister: false });
+  const [mqttClient] = mqttConnect.clients;
+  const channel = `/${OWNER}/${UDID}`;
+
+  // approval but no pending update → no download
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: true } })), { retain: false });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(downloads.length, 0, "no pending update → no download");
+
+  // pending update present, approval → download
+  client.state.pendingUpdate = { ott: "ott-token-123456", version: "1.2.3", status: "FIRMWARE_UPDATE" };
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: true } })), { retain: false });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(downloads.length, 1, "approval + pending → download");
+  assert.equal(downloads[0].source, "notification");
+  assert.equal(downloads[0].update.ott, "ott-token-123456");
+
+  // pending update present, denial → no further download
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: false } })), { retain: false });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(downloads.length, 1, "denial → no extra download");
+});

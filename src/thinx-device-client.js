@@ -995,6 +995,16 @@ export class ThinxDeviceClient extends EventEmitter {
     }
     this.saveState();
     this.emit("notification-response", entry);
+
+    // OTA mirror (faithful to THiNXLib32 NOTIFICATION case): an approval of a
+    // pending firmware update triggers the existing download. Nothing else runs.
+    const autoDownload = this.config.autoDownloadFirmware;
+    if (approved === true && autoDownload && this.state.pendingUpdate?.ott) {
+      const { ott, version, status } = this.state.pendingUpdate;
+      this.handleFirmwareUpdate({ ott, version, status }, "notification").catch((error) =>
+        this.emit("firmware-error", error)
+      );
+    }
     return entry;
   }
 
