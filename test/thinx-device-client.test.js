@@ -773,8 +773,17 @@ test("an approval with a pending update triggers the firmware download; denial a
   assert.equal(downloads[0].source, "notification");
   assert.equal(downloads[0].update.ott, "ott-token-123456");
 
-  // pending update present, denial → no further download
+  // bool-false is classified as echo (from device), not a recorded response
   mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { response_type: "bool", response: false } })), { retain: false });
   await new Promise((r) => setImmediate(r));
+  assert.equal(downloads.length, 1, "bool-false echo → no download");
+  assert.equal(client.safeState().notifications.responseCount, 2, "bool-false echo is not recorded");
+
+  // a genuine recorded denial (string "no") is recorded as not-approved and does not download
+  mqttClient.emit("message", channel, Buffer.from(JSON.stringify({ notification: { nid: "nid-9", response_type: "string", response: "no" } })), { retain: false });
+  await new Promise((r) => setImmediate(r));
   assert.equal(downloads.length, 1, "denial → no extra download");
+  const denialState = client.safeState().notifications;
+  assert.equal(denialState.responseCount, 3, "string denial is recorded");
+  assert.equal(denialState.lastResponse.approved, false, "denial recorded as not approved");
 });
