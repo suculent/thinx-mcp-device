@@ -97,6 +97,25 @@ const tools = [
     }
   }),
   tool(
+    "thinx_publish_notification",
+    "Publish an actionable notification to the device channel /owner/udid as a real THiNX device would. The THiNX cloud/console shows it with action buttons; the user's response comes back on the same channel. Emits { notification: { title?, body, response_type } } with no response field.",
+    {
+      type: "object",
+      additionalProperties: false,
+      required: ["body"],
+      properties: {
+        body: { type: "string", description: "Notification body text shown to the user." },
+        title: { type: "string", description: "Optional title (cosmetic; the console overrides it with \"Device Interaction\")." },
+        responseType: {
+          type: "string",
+          enum: ["bool", "string"],
+          description: "Expected response type. bool → true/false; string → \"yes\"/\"no\". Defaults to bool."
+        },
+        retain: { type: "boolean", description: "Retain the MQTT message. Defaults to false (a retained actionable would re-fire on reconnect)." }
+      }
+    }
+  ),
+  tool(
     "thinx_request_ott",
     "Request a one-time firmware token via POST /device/firmware { use: \"ott\" } using the device API key. Stores it as the pending update.",
     {
@@ -229,6 +248,8 @@ export class McpJsonRpcServer {
         return textResult(this.client.recentMessages(args.limit));
       case "thinx_publish_status":
         return textResult(this.client.publishStatus(args.message, { retain: args.retain }));
+      case "thinx_publish_notification":
+        return textResult(this.client.publishNotification(args));
       case "thinx_request_ott":
         return textResult(await this.client.requestOtt(args));
       case "thinx_download_firmware":
@@ -358,6 +379,14 @@ export class McpJsonRpcServer {
 
     this.client.on("command-error", (error) => {
       process.stderr.write(`[thinx-mcp-device] Command error: ${error.message}\n`);
+    });
+
+    this.client.on("notification-published", (info) => {
+      process.stderr.write(`[thinx-mcp-device] notification published on ${info.topic}: ${info.outstanding?.body ?? ""}\n`);
+    });
+
+    this.client.on("notification-response", (info) => {
+      process.stderr.write(`[thinx-mcp-device] notification response (${info.via}) approved=${info.approved}: ${JSON.stringify(info.response)}\n`);
     });
 
     // Containers created with --rm keep running if the process just exits, so
